@@ -128,6 +128,20 @@ data class AudioClipDebugUiState(
     val modelStatus: String,
 )
 
+data class AssistantSessionRowUiState(
+    val sessionId: String,
+    val sessionLabel: String,
+    val eventCount: Int,
+    val speechSummary: String,
+    val positionSummary: String,
+    val indoorOutdoor: String,
+    val locationLabel: String,
+    val calendarSummary: String,
+    val guessedUserScenario: String,
+    val actionPlan: String,
+    val modelLabel: String,
+)
+
 private data class AudioClipRecord(
     val wav: File,
     val capturedAtMs: Long,
@@ -302,6 +316,12 @@ class PermissionCommandCenterState internal constructor(
 
     private val _assistantHighlights = mutableStateListOf<String>()
     val assistantHighlights: List<String> get() = _assistantHighlights
+
+    var assistantSessionStatusMessage by mutableStateOf("No 15-minute session analysis yet")
+        private set
+
+    private val _assistantSessionRows = mutableStateListOf<AssistantSessionRowUiState>()
+    val assistantSessionRows: List<AssistantSessionRowUiState> get() = _assistantSessionRows
 
     var historyFilter by mutableStateOf(ActionHistoryFilter.ALL)
         private set
@@ -912,6 +932,56 @@ class PermissionCommandCenterState internal constructor(
         _assistantHighlights.clear()
         _assistantHighlights.addAll(highlights.distinct().take(8))
         assistantBriefStatusMessage = "$status | based on $eventCount context events"
+    }
+
+    fun updateAssistantSessions(rows: List<AssistantSessionRowUiState>, status: String) {
+        _assistantSessionRows.clear()
+        _assistantSessionRows.addAll(rows)
+        assistantSessionStatusMessage = if (rows.isEmpty()) {
+            "$status | no 15-minute sessions available"
+        } else {
+            "$status | sessions=${rows.size}"
+        }
+    }
+
+    fun refreshAssistantSessions(limit: Int = 24) {
+        val rows = ContextEventStore.getInstance(appContext)
+            .getRecent(limit = 1500)
+            .filter { it.category == "assistant_session" }
+            .mapNotNull { row ->
+                val payload = kotlin.runCatching { JSONObject(row.payloadJson).toMap() }.getOrNull().orEmpty()
+                val sessionId = payload["sessionId"]?.toString().orEmpty().ifBlank {
+                    "session_${payload["sessionStartMs"]?.toString().orEmpty()}"
+                }
+                val sessionLabel = payload["sessionLabel"]?.toString().orEmpty()
+                if (sessionLabel.isBlank()) return@mapNotNull null
+
+                AssistantSessionRowUiState(
+                    sessionId = sessionId,
+                    sessionLabel = sessionLabel,
+                    eventCount = payload["eventCount"].toString().toIntOrNull() ?: 0,
+                    speechSummary = payload["speechSummary"]?.toString().orEmpty(),
+                    positionSummary = payload["positionSummary"]?.toString().orEmpty(),
+                    indoorOutdoor = payload["indoorOutdoor"]?.toString().orEmpty(),
+                    locationLabel = payload["locationLabel"]?.toString().orEmpty(),
+                    calendarSummary = payload["calendarSummary"]?.toString().orEmpty(),
+                    guessedUserScenario = payload["guessedUserScenario"]?.toString()
+                        .orEmpty()
+                        .ifBlank { payload["suggestion"]?.toString().orEmpty() },
+                    actionPlan = payload["actionPlan"]?.toString().orEmpty(),
+                    modelLabel = payload["modelLabel"]?.toString().orEmpty(),
+                )
+            }
+            .distinctBy { it.sessionId }
+            .take(limit)
+
+        _assistantSessionRows.clear()
+        _assistantSessionRows.addAll(rows)
+        assistantSessionStatusMessage = if (rows.isEmpty()) {
+            "No 15-minute session analysis yet"
+        } else {
+            "Showing latest ${rows.size} 15-minute assistant sessions"
+        }
     }
 
     fun enqueueAction(planId: String, step: ActionStepPayload): Long {

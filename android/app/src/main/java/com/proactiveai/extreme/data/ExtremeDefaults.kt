@@ -23,6 +23,18 @@ object ExtremeDefaults {
                 )
             ),
             PluginDescriptor(
+                id = "sensor_fusion",
+                title = "Sensor Fusion",
+                description = "Capture accelerometer, gyroscope, light, proximity, pressure, and activity trends.",
+                enabledByDefault = true,
+                riskLevel = RiskLevel.HIGH,
+                permissions = listOf(
+                    runtime("sensor_activity_recognition", "Activity recognition", "android.permission.ACTIVITY_RECOGNITION", PermissionCategory.MOTION, "Detect static/walk/run/vehicle trend from sensor + steps.", 24),
+                    runtime("sensor_body_sensors", "Body sensors", "android.permission.BODY_SENSORS", PermissionCategory.HEALTH, "Enable device body sensor readings.", 24),
+                    runtime("sensor_body_sensors_bg", "Body sensors (background)", "android.permission.BODY_SENSORS_BACKGROUND", PermissionCategory.HEALTH, "Allow body sensors in background collection.", 24),
+                ),
+            ),
+            PluginDescriptor(
                 id = "audio_ambient",
                 title = "Audio Ambient",
                 description = "Capture voice environment cues for proactive understanding.",
@@ -33,6 +45,25 @@ object ExtremeDefaults {
                 )
             ),
             PluginDescriptor(
+                id = "system_device",
+                title = "System + Attention",
+                description = "Collect power, thermal, ringer, DND, overlay, alarms, files access, and other device-state context.",
+                enabledByDefault = true,
+                riskLevel = RiskLevel.HIGH,
+                permissions = listOf(
+                    runtime("read_phone_state", "Phone state", "android.permission.READ_PHONE_STATE", PermissionCategory.CONNECTIVITY, "Read coarse call/network state context.", 24),
+                    runtime("read_phone_numbers", "Phone numbers", "android.permission.READ_PHONE_NUMBERS", PermissionCategory.CONNECTIVITY, "Read line/account identifiers when available.", 24),
+                    runtime("camera", "Camera", "android.permission.CAMERA", PermissionCategory.MEDIA, "Enable camera-based visual context.", 24),
+                    settings("dnd_access", "DND policy access", PermissionCategory.NOTIFICATION, PermissionGate.SETTINGS_PAGE, "Read/align with Do Not Disturb context.", 168),
+                    settings("overlay", "Overlay (draw over apps)", PermissionCategory.APP_USAGE, PermissionGate.SETTINGS_PAGE, "Allow floating controls over other apps.", 168),
+                    settings("write_settings", "Modify system settings", PermissionCategory.APP_USAGE, PermissionGate.SETTINGS_PAGE, "Adjust brightness/volume style settings when needed.", 168),
+                    settings("exact_alarm", "Exact alarms", PermissionCategory.APP_USAGE, PermissionGate.SETTINGS_PAGE, "Schedule precise proactive wakeups.", 168),
+                    settings("battery_optimization", "Ignore battery optimization", PermissionCategory.APP_USAGE, PermissionGate.SETTINGS_PAGE, "Keep long-running background collection stable.", 168),
+                    settings("manage_all_files", "All files access", PermissionCategory.MEDIA, PermissionGate.SETTINGS_PAGE, "Read full local file tree for personal memory.", 168),
+                    settings("accessibility_service", "Accessibility access", PermissionCategory.APP_USAGE, PermissionGate.SETTINGS_PAGE, "Observe UI context with explicit user opt-in.", 168),
+                ),
+            ),
+            PluginDescriptor(
                 id = "health_connect",
                 title = "Health Connect",
                 description = "Read steps, sleep, and physiology context from Health Connect.",
@@ -40,6 +71,7 @@ object ExtremeDefaults {
                 riskLevel = RiskLevel.HIGH,
                 permissions = listOf(
                     runtime("body_sensors", "Body sensors", "android.permission.BODY_SENSORS", PermissionCategory.HEALTH, "Allow direct sensor data access.", 24),
+                    runtime("body_sensors_background", "Body sensors (background)", "android.permission.BODY_SENSORS_BACKGROUND", PermissionCategory.HEALTH, "Allow body sensors when app not visible.", 24),
                     settings("health_connect", "Health Connect grants", PermissionCategory.HEALTH, PermissionGate.HEALTH_CONNECT, "Grant granular health record reads.", 168),
                 )
             ),
@@ -65,6 +97,8 @@ object ExtremeDefaults {
                     runtime("read_images", "Photos", "android.permission.READ_MEDIA_IMAGES", PermissionCategory.MEDIA, "Read image metadata and selected content.", 720),
                     runtime("read_video", "Videos", "android.permission.READ_MEDIA_VIDEO", PermissionCategory.MEDIA, "Read video metadata and selected content.", 720),
                     runtime("read_audio", "Audio library", "android.permission.READ_MEDIA_AUDIO", PermissionCategory.MEDIA, "Read local audio metadata.", 720),
+                    runtime("read_visual_selected", "Selected visual media", "android.permission.READ_MEDIA_VISUAL_USER_SELECTED", PermissionCategory.MEDIA, "Read user-selected visual items on Android 14+.", 720),
+                    settings("manage_all_files_media", "All files access", PermissionCategory.MEDIA, PermissionGate.SETTINGS_PAGE, "Enable full local file indexing (notes/docs/media).", 720),
                 )
             ),
             PluginDescriptor(
@@ -91,8 +125,11 @@ object ExtremeDefaults {
                 riskLevel = RiskLevel.MEDIUM,
                 permissions = listOf(
                     runtime("bt_scan", "Bluetooth scan", "android.permission.BLUETOOTH_SCAN", PermissionCategory.CONNECTIVITY, "Detect nearby devices and movement context.", 24),
+                    runtime("bt_advertise", "Bluetooth advertise", "android.permission.BLUETOOTH_ADVERTISE", PermissionCategory.CONNECTIVITY, "Advertise/handshake with nearby peripherals.", 24),
                     runtime("bt_connect", "Bluetooth connect", "android.permission.BLUETOOTH_CONNECT", PermissionCategory.CONNECTIVITY, "Read and maintain connection status.", 24),
                     runtime("nearby_wifi", "Nearby Wi-Fi", "android.permission.NEARBY_WIFI_DEVICES", PermissionCategory.CONNECTIVITY, "Use nearby networks as place context.", 24),
+                    runtime("nfc", "NFC", "android.permission.NFC", PermissionCategory.CONNECTIVITY, "Read tap-based device/card context.", 24),
+                    runtime("uwb_ranging", "UWB ranging", "android.permission.UWB_RANGING", PermissionCategory.CONNECTIVITY, "Collect ultra-wideband nearby ranging context.", 24),
                 )
             ),
         )

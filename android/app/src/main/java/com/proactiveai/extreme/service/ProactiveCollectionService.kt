@@ -36,6 +36,7 @@ class ProactiveCollectionService : Service() {
     private var running = false
     private var stopRequested = false
     private var restartAttempted = false
+    private var assistantAutoRunning = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -99,6 +100,7 @@ class ProactiveCollectionService : Service() {
 
                     ContextEventStore.getInstance(this@ProactiveCollectionService).insertAll(finalEvents)
                     SyncScheduler.enqueueImmediate(this@ProactiveCollectionService)
+                    maybeRunAssistantAutoSession()
                 }
 
                 delay(COLLECTION_INTERVAL_MS)
@@ -217,6 +219,19 @@ class ProactiveCollectionService : Service() {
 
         restartAttempted = true
         kotlin.runCatching { start(this) }
+    }
+
+    private fun maybeRunAssistantAutoSession() {
+        if (assistantAutoRunning) return
+        assistantAutoRunning = true
+        serviceScope.launch {
+            try {
+                AssistantSessionAutoRunner.runIfDue(this@ProactiveCollectionService)
+            } catch (_: Throwable) {
+            } finally {
+                assistantAutoRunning = false
+            }
+        }
     }
 
     companion object {

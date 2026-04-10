@@ -23,6 +23,7 @@ object AppPrefs {
     private const val KEY_LOCAL_LLAMA_CONTEXT_SIZE = "local_llama_context_size"
     private const val KEY_LOCAL_LLAMA_THREADS = "local_llama_threads"
     private const val KEY_HF_TOKEN = "huggingface_token"
+    private const val KEY_ASSISTANT_LAST_SESSION_BUCKET = "assistant_last_session_bucket"
 
     private const val KEY_METRIC_SUGGESTIONS_TOTAL = "metric_suggestions_total"
     private const val KEY_METRIC_SUGGESTIONS_ACCEPTED = "metric_suggestions_accepted"
@@ -42,7 +43,12 @@ object AppPrefs {
     fun getEnabledPlugins(context: Context): Set<String> {
         val defaults = ExtremeDefaults.plugins().map { it.id }.toSet()
         val stored = prefs(context).getStringSet(KEY_ENABLED_PLUGINS, null)?.toSet()
-        return stored ?: defaults
+        return if (stored == null) {
+            defaults
+        } else {
+            // Auto-adopt newly introduced plugins into Extreme mode while preserving existing enabled set.
+            stored + defaults
+        }
     }
 
     fun setEnabledPlugins(context: Context, pluginIds: Set<String>) {
@@ -169,6 +175,14 @@ object AppPrefs {
 
     fun setHuggingFaceToken(context: Context, token: String) {
         prefs(context).edit().putString(KEY_HF_TOKEN, token).apply()
+    }
+
+    fun getAssistantLastSessionBucket(context: Context): Long {
+        return prefs(context).getLong(KEY_ASSISTANT_LAST_SESSION_BUCKET, -1L)
+    }
+
+    fun setAssistantLastSessionBucket(context: Context, bucket: Long) {
+        prefs(context).edit().putLong(KEY_ASSISTANT_LAST_SESSION_BUCKET, bucket).apply()
     }
 
     fun getEvaluationMetrics(context: Context): EvaluationMetrics {
