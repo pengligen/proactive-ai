@@ -1,0 +1,278 @@
+openapi: 3.0.3
+info:
+  title: ProactiveAI Orchestrator API
+  version: 0.1.0
+servers:
+  - url: https://api.proactiveai.local
+paths:
+  /v1/context/events: 
+    post:
+      summary: Ingest normalized context events
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventBatch'
+      responses:
+        '202':
+          description: Accepted
+  /v1/proactive/plan:
+    post:
+      summary: Generate proactive plan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlanRequest'
+      responses:
+        '200':
+          description: Action plan
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionPlan'
+  /v1/actions/execute:
+    post:
+      summary: Execute connector action
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActionExecutionRequest'
+      responses:
+        '200':
+          description: Execution result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionExecutionResult'
+  /v1/hitl/decision:
+    post:
+      summary: Submit user decision for gated actions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HitlDecision'
+      responses:
+        '200':
+          description: Decision applied
+  /v1/connectors/status:
+    get:
+      summary: Read connector authorization status
+      parameters:
+        - in: query
+          name: userId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Connector statuses
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectorStatusResponse'
+  /v1/connectors/{connector}/authorize:
+    post:
+      summary: Authorize connector for a user
+      parameters:
+        - in: path
+          name: connector
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectorAuthorizeRequest'
+      responses:
+        '200':
+          description: Connector authorization result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectorAuthorizeResponse'
+  /v1/connectors/{connector}/disconnect:
+    post:
+      summary: Disconnect connector for a user
+      parameters:
+        - in: path
+          name: connector
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectorAuthorizeRequest'
+      responses:
+        '200':
+          description: Connector disconnect result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectorAuthorizeResponse'
+components:
+  schemas:
+    EventBatch:
+      type: object
+      properties:
+        userId:
+          type: string
+        sessionId:
+          type: string
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContextEvent'
+      required: [userId, events]
+    ContextEvent:
+      type: object
+      properties:
+        eventId:
+          type: string
+        occurredAt:
+          type: integer
+          format: int64
+        source:
+          type: string
+        category:
+          type: string
+        summary:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+        sensitivity:
+          type: string
+          enum: [LOW, MEDIUM, HIGH]
+        ttlSeconds:
+          type: integer
+      required: [eventId, occurredAt, source, category, summary, sensitivity, ttlSeconds]
+    PlanRequest:
+      type: object
+      properties:
+        userId:
+          type: string
+        now:
+          type: integer
+          format: int64
+        contextWindow:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContextEvent'
+      required: [userId, now, contextWindow]
+    ActionPlan:
+      type: object
+      properties:
+        planId:
+          type: string
+        goal:
+          type: string
+        riskLevel:
+          type: string
+          enum: [LOW, MEDIUM, HIGH, CRITICAL]
+        requiresUserConfirmation:
+          type: boolean
+        explainWhy:
+          type: string
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActionStep'
+      required: [planId, goal, riskLevel, requiresUserConfirmation, steps]
+    ActionStep:
+      type: object
+      properties:
+        stepId:
+          type: string
+        connector:
+          type: string
+        operation:
+          type: string
+        args:
+          type: object
+          additionalProperties: true
+      required: [stepId, connector, operation]
+    ActionExecutionRequest:
+      type: object
+      properties:
+        planId:
+          type: string
+        stepId:
+          type: string
+      required: [planId, stepId]
+    ActionExecutionResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [SUCCESS, FAILED, CANCELLED]
+        details:
+          type: string
+      required: [status]
+    HitlDecision:
+      type: object
+      properties:
+        planId:
+          type: string
+        approved:
+          type: boolean
+        note:
+          type: string
+      required: [planId, approved]
+    ConnectorStatus:
+      type: object
+      properties:
+        connector:
+          type: string
+        connected:
+          type: boolean
+        accountLabel:
+          type: string
+          nullable: true
+        lastConnectedAt:
+          type: integer
+          format: int64
+          nullable: true
+      required: [connector, connected]
+    ConnectorStatusResponse:
+      type: object
+      properties:
+        userId:
+          type: string
+        connectors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConnectorStatus'
+      required: [userId, connectors]
+    ConnectorAuthorizeRequest:
+      type: object
+      properties:
+        userId:
+          type: string
+      required: [userId]
+    ConnectorAuthorizeResponse:
+      type: object
+      properties:
+        userId:
+          type: string
+        connector:
+          type: string
+        connected:
+          type: boolean
+        authUrl:
+          type: string
+          nullable: true
+        message:
+          type: string
+      required: [userId, connector, connected, message]

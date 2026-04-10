@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+
+# IDE / editors
+.idea/
+*.iml
+
+# Android build artifacts
+android/.gradle/
+android/.idea/
+android/build/
+android/local.properties
+android/app/build/
+android/app/.cxx/
+android/app/java-llama.cpp/
+
+# Android binaries
+*.apk
+*.aab
+
+# Local model artifacts (too large for git)
+*.gguf
+*.litertlm
+*.safetensors
+*.tar.gz
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local temp assets
+.tmp_litertlm_api/
+IMG_1384.HEIC.png
