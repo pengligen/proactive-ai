@@ -3,24 +3,43 @@ package com.proactiveai.extreme.ui.permission
 import android.content.Intent
 import android.location.Geocoder
 import android.media.MediaPlayer
+import android.net.Uri
 import android.os.Build
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -37,25 +56,35 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.proactiveai.extreme.app.AppPrefs
+import com.proactiveai.extreme.assistant.AssistantQuickAction
+import com.proactiveai.extreme.assistant.AssistantQuickActionPlanner
 import com.proactiveai.extreme.core.context.ContextEvent
 import com.proactiveai.extreme.core.context.Sensitivity
 import com.proactiveai.extreme.core.edge.EdgeModelProfile
 import com.proactiveai.extreme.core.edge.EdgeInferenceTrace
 import com.proactiveai.extreme.core.edge.LocalModelBackend
+import com.proactiveai.extreme.core.edge.LocalModelRuntimeConfig
 import com.proactiveai.extreme.core.edge.OnDeviceInferenceEngine
 import com.proactiveai.extreme.core.model.PermissionGate
 import com.proactiveai.extreme.core.model.RiskLevel
@@ -71,24 +100,38 @@ import com.proactiveai.extreme.orchestrator.OrchestratorConfig
 import com.proactiveai.extreme.orchestrator.PlanRequestPayload
 import com.proactiveai.extreme.orchestrator.toMap
 import com.proactiveai.extreme.permission.PermissionStatusResolver
+import com.proactiveai.extreme.service.AssistantSessionAutoRunner
+import com.proactiveai.extreme.service.DailyFocusTop3AutoRunner
 import com.proactiveai.extreme.service.ProactiveCollectionService
 import com.proactiveai.extreme.storage.ContextEventStore
 import com.proactiveai.extreme.storage.toPayload
 import com.proactiveai.extreme.sync.SyncScheduler
 import com.proactiveai.extreme.ui.AppTab
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val ASSISTANT_SESSION_UI_REFRESH_MS = 60_000L
 private const val CONTEXT_CARD_MAX_ITEMS = 10
 private val CONTEXT_CARD_SCROLL_MAX_HEIGHT = 420.dp
+private const val MODEL_JOURNAL_MAX_ITEMS = 20
+private val MODEL_JOURNAL_SCROLL_MAX_HEIGHT = 520.dp
+private const val ASSISTANT_DIARY_MAX_ITEMS = 12
+private const val ASSISTANT_DIARY_WINDOW_MS = 12 * 60 * 60 * 1000L
+private const val ASSISTANT_DIARY_REFRESH_MS = ASSISTANT_DIARY_WINDOW_MS
+private val ASSISTANT_DIARY_SCROLL_MAX_HEIGHT = 520.dp
+private const val EXECUTION_QUEUE_RENDER_MAX_ITEMS = 12
+private val EXECUTION_QUEUE_SCROLL_MAX_HEIGHT = 420.dp
 
 @Composable
 fun PermissionCommandCenterScreen(
@@ -99,7 +142,7 @@ fun PermissionCommandCenterScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
-    val gateway = remember { HttpOrchestratorGateway() }
+    val gateway = remember(context) { HttpOrchestratorGateway(appContext = context.applicationContext) }
     val store = remember { ContextEventStore.getInstance(context) }
     var showInferenceTestDialog by remember { mutableStateOf(false) }
     var showInferenceResultDialog by remember { mutableStateOf(false) }
@@ -111,12 +154,59 @@ fun PermissionCommandCenterScreen(
     var modelConfigEnabled by rememberSaveable { mutableStateOf(state.localModelEnabled) }
     var modelConfigPath2B by rememberSaveable { mutableStateOf(state.localModelPath2B) }
     var modelConfigPath4B by rememberSaveable { mutableStateOf(state.localModelPath4B) }
+    var modelConfigOpenAiKey by rememberSaveable { mutableStateOf(state.openAiApiKey) }
     var activeAudioClipPath by rememberSaveable { mutableStateOf("") }
     var audioReplayRunning by rememberSaveable { mutableStateOf(false) }
+    var cloudTranscribeRunning by rememberSaveable { mutableStateOf(false) }
     var assistantSessionGenerating by remember { mutableStateOf(false) }
+    var manualSpeechIntakeRunning by rememberSaveable { mutableStateOf(false) }
+    var manualSpeechHoldActive by rememberSaveable { mutableStateOf(false) }
+    var manualSpeechBackgroundTranscribeCount by rememberSaveable { mutableStateOf(0) }
+    var manualSpeechRequestSeq by rememberSaveable { mutableStateOf(0L) }
+    var manualSpeechLatestHandledSeq by rememberSaveable { mutableStateOf(0L) }
+    var manualSpeechIntakeStatus by rememberSaveable { mutableStateOf("No manual speech intake yet.") }
+    var manualSpeechLatestTranscript by rememberSaveable { mutableStateOf("") }
+    var manualSpeechIntakeJob by remember { mutableStateOf<Job?>(null) }
+    val manualSpeechHoldStopSignal = remember { AtomicBoolean(false) }
     var audioPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+    var dailyFocusGenerating by rememberSaveable { mutableStateOf(false) }
+    var fourHourDiaryRows by remember { mutableStateOf(emptyList<FourHourDiaryRow>()) }
+    var fourHourDiaryStatus by remember { mutableStateOf("No 12-hour diary yet") }
+    var fourHourDiaryRefreshing by remember { mutableStateOf(false) }
+    var fourHourDiaryQueuedRefresh by remember { mutableStateOf(false) }
+    var lastFourHourDiaryRefreshAt by remember { mutableStateOf(0L) }
+    var inAppSearchAction by remember { mutableStateOf<AssistantQuickAction?>(null) }
+    var inAppSearchUrl by remember { mutableStateOf("") }
+    var inAppSearchAiMode by remember { mutableStateOf(false) }
+
+    fun isGlobalLocked(): Boolean = state.globalLockEnabled
+
+    fun lockBlockedMessage(action: String): String {
+        return "Global lock enabled: blocked $action."
+    }
+
+    fun markLockBlocked(action: String) {
+        val message = lockBlockedMessage(action)
+        state.setPlanPreview(message)
+        state.updateConnectorStatusMessage(message)
+    }
+
+    fun openQuickActionInApp(action: AssistantQuickAction) {
+        if (isGlobalLocked()) {
+            markLockBlocked("in-app AI search")
+            return
+        }
+        val resolved = resolveInAppQuickActionUrl(action.url)
+        inAppSearchAction = action
+        inAppSearchUrl = resolved.url
+        inAppSearchAiMode = resolved.aiMode
+    }
 
     fun refreshConnectors() {
+        if (isGlobalLocked()) {
+            markLockBlocked("connector sync")
+            return
+        }
         scope.launch(Dispatchers.IO) {
             val userId = AppPrefs.getUserId(context)
             val connectors = gateway.connectorStatus(userId).getOrNull()
@@ -152,6 +242,10 @@ fun PermissionCommandCenterScreen(
 
     DisposableEffect(Unit) {
         onDispose {
+            manualSpeechHoldStopSignal.set(true)
+            manualSpeechHoldActive = false
+            manualSpeechIntakeRunning = false
+            manualSpeechIntakeJob?.cancel()
             kotlin.runCatching { audioPlayer?.stop() }
             kotlin.runCatching { audioPlayer?.release() }
             audioPlayer = null
@@ -232,6 +326,21 @@ fun PermissionCommandCenterScreen(
         }
     }
 
+    fun cloudTranscribeSingleWavClip(path: String) {
+        if (path.isBlank() || cloudTranscribeRunning) return
+        if (isGlobalLocked()) {
+            markLockBlocked("cloud transcription")
+            return
+        }
+        cloudTranscribeRunning = true
+        scope.launch(Dispatchers.IO) {
+            state.runCloudTranscribeSingleAudioClip(path)
+            withContext(Dispatchers.Main) {
+                cloudTranscribeRunning = false
+            }
+        }
+    }
+
     fun buildContextWindow(limit: Int = 60): List<ContextEventPayload> {
         return store.getRecent(limit).map { event ->
             val payloadMap = jsonStringToPayloadMap(event.payloadJson)
@@ -295,6 +404,7 @@ fun PermissionCommandCenterScreen(
                 "guessedUserScenario" to row.guessedUserScenario,
                 "suggestion" to row.guessedUserScenario,
                 "actionPlan" to row.actionPlan,
+                "quickActions" to AssistantQuickActionPlanner.toPayload(row.quickActions),
                 "modelLabel" to row.modelLabel,
             ),
             sensitivity = Sensitivity.HIGH,
@@ -327,6 +437,10 @@ fun PermissionCommandCenterScreen(
     }
 
     fun fetchPlanWithEdgeInference() {
+        if (isGlobalLocked()) {
+            markLockBlocked("plan generation and model inference")
+            return
+        }
         scope.launch(Dispatchers.IO) {
             val contextWindow = buildContextWindow()
             val edgeModel = EdgeModelProfile.fromId(state.edgeModelId)
@@ -382,6 +496,12 @@ fun PermissionCommandCenterScreen(
     }
 
     fun runInferenceTest(prompt: String) {
+        if (isGlobalLocked()) {
+            markLockBlocked("manual inference test")
+            inferenceResultText = "Global lock enabled: prompt inference is blocked."
+            showInferenceResultDialog = true
+            return
+        }
         scope.launch(Dispatchers.IO) {
             val edgeModel = EdgeModelProfile.fromId(state.edgeModelId)
             val trace = OnDeviceInferenceEngine.inferFromPromptWithTrace(
@@ -431,6 +551,16 @@ fun PermissionCommandCenterScreen(
     }
 
     fun generateContextInsight() {
+        if (isGlobalLocked()) {
+            state.updateContextInsight(
+                summary = "Global lock enabled: local context inference is blocked.",
+                actions = listOf("Disable Global Lock to allow inference."),
+                eventCount = 0,
+                status = "Context inference blocked",
+            )
+            markLockBlocked("context insight inference")
+            return
+        }
         scope.launch(Dispatchers.IO) {
             val contextWindow = buildContextWindow(limit = 120)
             val edgeModel = EdgeModelProfile.fromId(state.edgeModelId)
@@ -463,6 +593,16 @@ fun PermissionCommandCenterScreen(
     }
 
     fun generateAssistantBrief() {
+        if (isGlobalLocked()) {
+            state.updateAssistantBrief(
+                briefText = "Global lock enabled: assistant brief inference is blocked.",
+                highlights = listOf("Disable Global Lock to generate assistant brief."),
+                eventCount = 0,
+                status = "Assistant brief blocked",
+            )
+            markLockBlocked("assistant brief inference")
+            return
+        }
         scope.launch(Dispatchers.IO) {
             val contextWindow = buildContextWindow(limit = 120)
             val edgeModel = EdgeModelProfile.fromId(state.edgeModelId)
@@ -497,6 +637,14 @@ fun PermissionCommandCenterScreen(
 
     fun generateAssistantSessions() {
         if (assistantSessionGenerating) return
+        if (isGlobalLocked()) {
+            state.updateAssistantSessions(
+                rows = state.assistantSessionRows,
+                status = "Assistant session generation blocked by Global Lock",
+            )
+            markLockBlocked("assistant session inference")
+            return
+        }
         assistantSessionGenerating = true
         scope.launch(Dispatchers.IO) {
             try {
@@ -537,21 +685,30 @@ fun PermissionCommandCenterScreen(
                         fallbackActionPlan = heuristicGuess.actionPlan,
                         preferFallback = !result.nativeModelUsed,
                     )
+                    val quickActions = AssistantQuickActionPlanner.inferQuickActions(
+                        speechSummary = snapshot.speechSummary,
+                        guessedUserScenario = parsed.guessedUserScenario,
+                        actionPlan = parsed.actionPlan,
+                        locationLabel = snapshot.locationLabel,
+                        calendarSummary = snapshot.calendarSummary,
+                        extraText = raw,
+                    )
 
-                AssistantSessionRowUiState(
-                    sessionId = session.sessionId,
-                    sessionLabel = formatSessionRange(session.startMs, session.endMs),
-                    eventCount = session.events.size,
-                    speechSummary = snapshot.speechSummary,
-                    positionSummary = snapshot.positionSummary,
-                    indoorOutdoor = snapshot.indoorOutdoor,
-                    locationLabel = snapshot.locationLabel,
-                    calendarSummary = snapshot.calendarSummary,
-                    guessedUserScenario = parsed.guessedUserScenario,
-                    actionPlan = parsed.actionPlan,
-                    modelLabel = "${result.model.label} | ${result.strategyLabel}",
-                )
-            }
+                    AssistantSessionRowUiState(
+                        sessionId = session.sessionId,
+                        sessionLabel = formatSessionRange(session.startMs, session.endMs),
+                        eventCount = session.events.size,
+                        speechSummary = snapshot.speechSummary,
+                        positionSummary = snapshot.positionSummary,
+                        indoorOutdoor = snapshot.indoorOutdoor,
+                        locationLabel = snapshot.locationLabel,
+                        calendarSummary = snapshot.calendarSummary,
+                        guessedUserScenario = parsed.guessedUserScenario,
+                        actionPlan = parsed.actionPlan,
+                        quickActions = quickActions,
+                        modelLabel = "${result.model.label} | ${result.strategyLabel}",
+                    )
+                }
 
                 sessions.zip(rows).forEach { (session, row) ->
                     persistAssistantSessionRow(
@@ -573,32 +730,231 @@ fun PermissionCommandCenterScreen(
         }
     }
 
-    LaunchedEffect(activeTab, state.contextTimeline.size, state.contextInsightStatusMessage, state.assistantBriefStatusMessage) {
-        if (activeTab == AppTab.CONTEXTS) {
-            state.refreshAudioClips()
-            state.refreshContextLogs()
-            state.refreshContextTimeline()
-        }
-        if (
-            activeTab == AppTab.CONTEXTS &&
-            state.contextTimeline.isNotEmpty() &&
-            state.contextInsightStatusMessage.startsWith("No context insight")
-        ) {
-            generateContextInsight()
-        }
-        if (
-            activeTab == AppTab.ASSISTANT &&
-            state.contextTimeline.isNotEmpty() &&
-            state.assistantBriefStatusMessage.startsWith("No proactive assistant brief")
-        ) {
-            generateAssistantBrief()
-        }
-        if (activeTab == AppTab.ASSISTANT) {
-            state.refreshContextTimeline()
-            state.refreshAssistantSessions()
-            if (state.assistantSessionRows.isEmpty() && state.contextTimeline.isNotEmpty()) {
-                generateAssistantSessions()
+    fun refreshTwelveHourDiary(
+        force: Boolean = false,
+        userInitiated: Boolean = false,
+    ) {
+        if (fourHourDiaryRefreshing) {
+            if (force && userInitiated) {
+                fourHourDiaryQueuedRefresh = true
+                fourHourDiaryStatus = "Diary generation in progress. Queued one more refresh."
             }
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (!force && now - lastFourHourDiaryRefreshAt < ASSISTANT_DIARY_REFRESH_MS) return
+        if (isGlobalLocked()) {
+            fourHourDiaryStatus = "Global lock enabled: 12-hour diary generation is blocked."
+            return
+        }
+
+        if (userInitiated) {
+            fourHourDiaryStatus = "Refreshing 12-hour diary..."
+        }
+        fourHourDiaryRefreshing = true
+        scope.launch(Dispatchers.IO) {
+            try {
+                val contextWindow = buildContextWindow(limit = 2400)
+                val edgeModel = EdgeModelProfile.fromId(state.edgeModelId)
+                val rows = buildFourHourDiaryRows(
+                    context = context,
+                    events = contextWindow,
+                    maxRows = ASSISTANT_DIARY_MAX_ITEMS,
+                    model = edgeModel,
+                    runtimeConfig = state.localRuntimeConfig(),
+                    onTrace = { trace, eventCount ->
+                        persistModelTrace(
+                            trigger = "assistant_diary_12h",
+                            trace = trace,
+                            contextEventCount = eventCount,
+                        )
+                    },
+                )
+                withContext(Dispatchers.Main) {
+                    fourHourDiaryRows = rows
+                    fourHourDiaryStatus = if (rows.isEmpty()) {
+                        "No 12-hour diary windows yet. Keep collection running."
+                    } else {
+                        "Showing latest ${rows.size} 12-hour diary windows (today-first)"
+                    }
+                    lastFourHourDiaryRefreshAt = System.currentTimeMillis()
+                }
+            } finally {
+                var rerunQueued = false
+                withContext(Dispatchers.Main) {
+                    fourHourDiaryRefreshing = false
+                    if (fourHourDiaryQueuedRefresh) {
+                        rerunQueued = true
+                        fourHourDiaryQueuedRefresh = false
+                        fourHourDiaryStatus = "Running queued diary refresh..."
+                    }
+                }
+                if (rerunQueued) {
+                    withContext(Dispatchers.Main) {
+                        refreshTwelveHourDiary(force = true, userInitiated = false)
+                    }
+                }
+            }
+        }
+    }
+
+    fun startManualSpeechIntakeHold() {
+        if (manualSpeechIntakeRunning || manualSpeechIntakeJob != null || manualSpeechHoldActive) return
+        if (isGlobalLocked()) {
+            markLockBlocked("manual speech intake")
+            manualSpeechIntakeStatus = "Global lock enabled: manual speech intake blocked."
+            return
+        }
+
+        val requestSeq = manualSpeechRequestSeq + 1L
+        manualSpeechRequestSeq = requestSeq
+        manualSpeechLatestHandledSeq = requestSeq
+        manualSpeechHoldStopSignal.set(false)
+        manualSpeechIntakeRunning = true
+        manualSpeechHoldActive = true
+        manualSpeechIntakeStatus = "Listening... keep pressing and speak. Release to stop."
+        manualSpeechIntakeJob = scope.launch(Dispatchers.IO) {
+            try {
+                val result = state.captureManualSpeechIntakeContext(
+                    shouldStop = { manualSpeechHoldStopSignal.get() },
+                )
+                withContext(Dispatchers.Main) {
+                    manualSpeechIntakeRunning = false
+                    manualSpeechHoldActive = false
+                    manualSpeechIntakeJob = null
+                    scope.launch {
+                        state.refreshAudioClips()
+                        state.refreshContextTimeline()
+                    }
+
+                    when (result.status) {
+                        "captured" -> {
+                            manualSpeechIntakeStatus = "WAV saved. Transcribing in background with GPT-4o..."
+                            val wav = result.wavPath.orEmpty().trim()
+                            if (wav.isBlank()) {
+                                manualSpeechIntakeStatus = "WAV saved but path is missing; cannot transcribe."
+                                return@withContext
+                            }
+                            manualSpeechBackgroundTranscribeCount += 1
+                            scope.launch(Dispatchers.IO) {
+                                val transcribed = kotlin.runCatching {
+                                    state.transcribeManualSpeechIntakeContextFromWav(wav)
+                                }.getOrElse { err ->
+                                    ManualSpeechIntakeResult(
+                                        status = "error",
+                                        transcript = "",
+                                        cloudRefined = false,
+                                        wavPath = wav,
+                                        detail = "Background transcription failed: ${err.message.orEmpty().ifBlank { "unknown_error" }}",
+                                    )
+                                }
+                                withContext(Dispatchers.Main) {
+                                    manualSpeechBackgroundTranscribeCount =
+                                        (manualSpeechBackgroundTranscribeCount - 1).coerceAtLeast(0)
+                                    if (requestSeq >= manualSpeechLatestHandledSeq) {
+                                        manualSpeechLatestHandledSeq = requestSeq
+                                        manualSpeechIntakeStatus = transcribed.detail
+                                        if (transcribed.transcript.isNotBlank()) {
+                                            manualSpeechLatestTranscript = transcribed.transcript.trim()
+                                        }
+                                    }
+                                    scope.launch {
+                                        state.refreshAudioClips()
+                                        state.refreshContextTimeline()
+                                    }
+                                    scope.launch(Dispatchers.IO) {
+                                        if (transcribed.status == "recognized") {
+                                            kotlin.runCatching {
+                                                AssistantSessionAutoRunner.refreshSessionForTimestamp(
+                                                    context = context.applicationContext,
+                                                    occurredAtMs = System.currentTimeMillis(),
+                                                )
+                                            }
+                                        }
+                                        withContext(Dispatchers.Main) {
+                                            state.refreshAssistantSessions()
+                                            refreshTwelveHourDiary(force = true)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        else -> {
+                            if (requestSeq >= manualSpeechLatestHandledSeq) {
+                                manualSpeechLatestHandledSeq = requestSeq
+                                manualSpeechIntakeStatus = result.detail
+                                if (result.transcript.isNotBlank()) {
+                                    manualSpeechLatestTranscript = result.transcript.trim()
+                                }
+                            }
+                            scope.launch(Dispatchers.IO) {
+                                if (result.status == "recognized") {
+                                    kotlin.runCatching {
+                                        AssistantSessionAutoRunner.refreshSessionForTimestamp(
+                                            context = context.applicationContext,
+                                            occurredAtMs = System.currentTimeMillis(),
+                                        )
+                                    }
+                                }
+                                withContext(Dispatchers.Main) {
+                                    state.refreshAssistantSessions()
+                                    refreshTwelveHourDiary(force = true)
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                withContext(Dispatchers.Main) {
+                    manualSpeechIntakeRunning = false
+                    manualSpeechHoldActive = false
+                    manualSpeechIntakeJob = null
+                    manualSpeechIntakeStatus = "Manual intake failed: ${t.message.orEmpty().ifBlank { "unknown_error" }}"
+                }
+            }
+        }
+    }
+
+    fun stopManualSpeechIntakeHold() {
+        if (!manualSpeechIntakeRunning && !manualSpeechHoldActive) return
+        manualSpeechHoldStopSignal.set(true)
+        manualSpeechHoldActive = false
+        if (manualSpeechIntakeRunning) {
+            manualSpeechIntakeStatus = "Stopping capture... saving WAV."
+        }
+    }
+
+    LaunchedEffect(activeTab) {
+        when (activeTab) {
+            AppTab.CONTEXTS -> {
+                state.refreshAudioClips()
+                state.refreshContextLogs()
+                state.refreshContextTimeline()
+                if (
+                    state.contextTimeline.isNotEmpty() &&
+                    state.contextInsightStatusMessage.startsWith("No context insight")
+                ) {
+                    generateContextInsight()
+                }
+            }
+
+            AppTab.ASSISTANT -> {
+                state.refreshContextTimeline()
+                state.refreshAssistantSessions()
+                refreshTwelveHourDiary(force = false)
+                if (
+                    state.contextTimeline.isNotEmpty() &&
+                    state.assistantBriefStatusMessage.startsWith("No proactive assistant brief")
+                ) {
+                    generateAssistantBrief()
+                }
+                if (state.assistantSessionRows.isEmpty() && state.contextTimeline.isNotEmpty()) {
+                    generateAssistantSessions()
+                }
+            }
+
+            else -> Unit
         }
     }
 
@@ -610,7 +966,20 @@ fun PermissionCommandCenterScreen(
         }
     }
 
+    LaunchedEffect(activeTab) {
+        if (activeTab != AppTab.ASSISTANT) return@LaunchedEffect
+        while (true) {
+            delay(ASSISTANT_DIARY_REFRESH_MS)
+            refreshTwelveHourDiary(force = false)
+        }
+    }
+
     fun submitHitlDecision(plan: ActionPlanPayload, step: ActionStepPayload, approved: Boolean) {
+        if (isGlobalLocked()) {
+            state.markStepExecution(step.stepId, lockBlockedMessage("HITL submit"))
+            markLockBlocked("HITL submit")
+            return
+        }
         scope.launch(Dispatchers.IO) {
             val submitted = gateway.submitHitlDecision(
                 HitlDecisionPayload(
@@ -635,6 +1004,11 @@ fun PermissionCommandCenterScreen(
     }
 
     fun executeStep(plan: ActionPlanPayload, step: ActionStepPayload) {
+        if (isGlobalLocked()) {
+            state.markStepExecution(step.stepId, lockBlockedMessage("action execution"))
+            markLockBlocked("action execution")
+            return
+        }
         val queueId = state.enqueueAction(plan.planId, step)
         state.markStepExecution(step.stepId, "Queued action #$queueId")
         state.triggerQueueExecutionNow()
@@ -654,7 +1028,42 @@ fun PermissionCommandCenterScreen(
         }
     }
 
+    fun generateDailyFocusNow() {
+        if (dailyFocusGenerating) return
+        if (isGlobalLocked()) {
+            markLockBlocked("daily focus generation")
+            state.updateQueueStatusMessage("Global lock enabled: daily focus generation blocked.")
+            return
+        }
+        dailyFocusGenerating = true
+        state.updateQueueStatusMessage("Generating today's Top3 focus from last 48h context...")
+        scope.launch(Dispatchers.IO) {
+            val generated = kotlin.runCatching {
+                DailyFocusTop3AutoRunner.runNow(
+                    context = context.applicationContext,
+                    replaceExistingForDay = true,
+                )
+            }.getOrDefault(false)
+
+            withContext(Dispatchers.Main) {
+                dailyFocusGenerating = false
+                state.refreshQueue()
+                state.refreshContextTimeline()
+                state.refreshModelInteractions()
+                state.updateQueueStatusMessage(if (generated) {
+                    "Daily Focus Top3 generated and queued."
+                } else {
+                    "Daily Focus Top3 not generated (insufficient context yet)."
+                })
+            }
+        }
+    }
+
     fun authorizeConnector(connectorId: String) {
+        if (isGlobalLocked()) {
+            markLockBlocked("connector authorize")
+            return
+        }
         scope.launch(Dispatchers.IO) {
             val userId = AppPrefs.getUserId(context)
             val result = gateway.authorizeConnector(connectorId, userId).getOrNull()
@@ -673,6 +1082,10 @@ fun PermissionCommandCenterScreen(
     }
 
     fun disconnectConnector(connectorId: String) {
+        if (isGlobalLocked()) {
+            markLockBlocked("connector disconnect")
+            return
+        }
         scope.launch(Dispatchers.IO) {
             val userId = AppPrefs.getUserId(context)
             val result = gateway.disconnectConnector(connectorId, userId).getOrNull()
@@ -702,16 +1115,21 @@ fun PermissionCommandCenterScreen(
                     SummaryCard(
                         state = state,
                         onToggleMaster = { state.toggleMaster(it) },
+                        onToggleGlobalLock = { enabled -> state.persistGlobalLockEnabled(enabled) },
                         onGrantAll = ::runGrantAllWizard,
                         onOpenNextSettings = {
                             state.firstPendingSettingsPermission()?.let { openSettings(it) }
                         },
                         onCheckBackend = {
-                            state.setOrchestratorHealth(null)
-                            scope.launch(Dispatchers.IO) {
-                                val healthy = gateway.health().getOrNull() == true
-                                withContext(Dispatchers.Main) {
-                                    state.setOrchestratorHealth(healthy)
+                            if (isGlobalLocked()) {
+                                markLockBlocked("backend ping")
+                            } else {
+                                state.setOrchestratorHealth(null)
+                                scope.launch(Dispatchers.IO) {
+                                    val healthy = gateway.health().getOrNull() == true
+                                    withContext(Dispatchers.Main) {
+                                        state.setOrchestratorHealth(healthy)
+                                    }
                                 }
                             }
                         },
@@ -757,6 +1175,7 @@ fun PermissionCommandCenterScreen(
                             modelConfigEnabled = state.localModelEnabled
                             modelConfigPath2B = state.localModelPath2B
                             modelConfigPath4B = state.localModelPath4B
+                            modelConfigOpenAiKey = state.openAiApiKey
                             showModelConfigDialog = true
                         },
                         onRefreshModelCalls = { state.refreshModelInteractions() },
@@ -777,6 +1196,7 @@ fun PermissionCommandCenterScreen(
                         state = state,
                         activeClipPath = activeAudioClipPath,
                         replayRunning = audioReplayRunning,
+                        cloudTranscribeRunning = cloudTranscribeRunning,
                         onRefresh = { state.refreshAudioClips() },
                         onReplayLatest = { replayLatestWavClips() },
                         onClear = {
@@ -784,6 +1204,7 @@ fun PermissionCommandCenterScreen(
                             state.clearAudioClips()
                         },
                         onReplaySingle = { path -> replaySingleWavClip(path) },
+                        onCloudTranscribeSingle = { path -> cloudTranscribeSingleWavClip(path) },
                         onPlayOrStop = { path -> playAudioClip(path) },
                     )
                 }
@@ -816,9 +1237,20 @@ fun PermissionCommandCenterScreen(
 
             AppTab.ASSISTANT -> {
                 item {
+                    ManualSpeechIntakeCard(
+                        running = manualSpeechHoldActive,
+                        status = manualSpeechIntakeStatus,
+                        latestTranscript = manualSpeechLatestTranscript,
+                        onPressStart = ::startManualSpeechIntakeHold,
+                        onPressEnd = ::stopManualSpeechIntakeHold,
+                    )
+                }
+
+                item {
                     AssistantSessionTableCard(
                         state = state,
                         onGenerate = ::generateAssistantSessions,
+                        onOpenQuickAction = ::openQuickActionInApp,
                     )
                 }
 
@@ -830,23 +1262,10 @@ fun PermissionCommandCenterScreen(
                 }
 
                 item {
-                    ActionCenterCard(
-                        state = state,
-                        onModelSelected = { modelId -> state.setEdgeModel(modelId) },
-                        onToggleAutoExecuteLowRisk = { enabled -> state.persistAutoExecuteLowRisk(enabled) },
-                        onGeneratePlan = ::fetchPlanWithEdgeInference,
-                        onOpenInferenceTest = { showInferenceTestDialog = true },
-                        onOpenModelConfig = {
-                            modelConfigEnabled = state.localModelEnabled
-                            modelConfigPath2B = state.localModelPath2B
-                            modelConfigPath4B = state.localModelPath4B
-                            showModelConfigDialog = true
-                        },
-                        onAutoExecute = ::runAutoExecuteForCurrentPlan,
-                        onResetMetrics = { state.resetMetrics() },
-                        onApproveStep = { plan, step -> submitHitlDecision(plan, step, approved = true) },
-                        onDenyStep = { plan, step -> submitHitlDecision(plan, step, approved = false) },
-                        onExecuteStep = ::executeStep,
+                    AssistantDiaryListCard(
+                        rows = fourHourDiaryRows,
+                        status = fourHourDiaryStatus,
+                        onRefresh = { refreshTwelveHourDiary(force = true, userInitiated = true) },
                     )
                 }
 
@@ -855,6 +1274,8 @@ fun PermissionCommandCenterScreen(
                         state = state,
                         onRefresh = { state.refreshQueue() },
                         onRunNow = { state.triggerQueueExecutionNow() },
+                        onGenerateDailyFocus = ::generateDailyFocusNow,
+                        generatingDailyFocus = dailyFocusGenerating,
                         onRetry = { queueId ->
                             state.retryQueueItem(queueId)
                             state.triggerQueueExecutionNow()
@@ -902,6 +1323,8 @@ fun PermissionCommandCenterScreen(
             onEnabledChange = { modelConfigEnabled = it },
             onPath2BChange = { modelConfigPath2B = it },
             onPath4BChange = { modelConfigPath4B = it },
+            openAiApiKey = modelConfigOpenAiKey,
+            onOpenAiApiKeyChange = { modelConfigOpenAiKey = it },
             onDismiss = { showModelConfigDialog = false },
             onSave = {
                 state.persistLocalModelConfig(
@@ -914,8 +1337,22 @@ fun PermissionCommandCenterScreen(
                     llamaContextSize = state.localLlamaContextSize,
                     llamaThreads = state.localLlamaThreads,
                 )
+                state.persistOpenAiApiKey(modelConfigOpenAiKey.trim())
                 showModelConfigDialog = false
                 state.setPlanPreview("Local model config updated")
+            },
+        )
+    }
+
+    if (inAppSearchAction != null && inAppSearchUrl.isNotBlank()) {
+        InAppAiSearchDialog(
+            title = inAppSearchAction?.label.orEmpty().ifBlank { "AI Search" },
+            url = inAppSearchUrl,
+            aiMode = inAppSearchAiMode,
+            onDismiss = {
+                inAppSearchAction = null
+                inAppSearchUrl = ""
+                inAppSearchAiMode = false
             },
         )
     }
@@ -925,6 +1362,7 @@ fun PermissionCommandCenterScreen(
 private fun SummaryCard(
     state: PermissionCommandCenterState,
     onToggleMaster: (Boolean) -> Unit,
+    onToggleGlobalLock: (Boolean) -> Unit,
     onGrantAll: () -> Unit,
     onOpenNextSettings: () -> Unit,
     onCheckBackend: () -> Unit,
@@ -968,6 +1406,27 @@ private fun SummaryCard(
                 text = "Plugins: ${state.plugins.count { it.enabled }}/${state.plugins.size} | Service: ${if (state.collectionEnabled) "ON" else "OFF"}",
                 style = MaterialTheme.typography.bodyMedium,
             )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val lockOn = state.globalLockEnabled
+                Text(
+                    text = "Global Lock: ${if (lockOn) "LOCKED" else "UNLOCKED"}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (lockOn) Color(0xFFFCA5A5) else Color(0xFF86EFAC),
+                )
+                Button(
+                    onClick = { onToggleGlobalLock(!lockOn) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (lockOn) Color(0xFFB91C1C) else Color(0xFF15803D),
+                        contentColor = Color.White,
+                    ),
+                ) {
+                    Text(if (lockOn) "LOCK ON" else "LOCK OFF")
+                }
+            }
             Text(
                 text = "Queued Events: ${state.unsyncedEvents}",
                 style = MaterialTheme.typography.bodySmall,
@@ -1105,6 +1564,11 @@ private fun ModelManagementCard(
                 style = MaterialTheme.typography.bodySmall,
                 color = Color(0xFF334155),
             )
+            Text(
+                text = "Cloud STT key: ${if (state.openAiApiKey.isBlank()) "missing" else "configured"}",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (state.openAiApiKey.isBlank()) Color(0xFFB45309) else Color(0xFF15803D),
+            )
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = onOpenInferenceTest) {
@@ -1126,6 +1590,7 @@ private fun ModelInteractionJournalCard(
     state: PermissionCommandCenterState,
     onRefresh: () -> Unit,
 ) {
+    val journalItems = state.modelInteractions.take(MODEL_JOURNAL_MAX_ITEMS)
     Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
         Column(
             modifier = Modifier
@@ -1161,36 +1626,50 @@ private fun ModelInteractionJournalCard(
                     color = Color(0xFF64748B),
                 )
             } else {
-                state.modelInteractions.forEach { item ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                Text(
+                    text = "Showing ${journalItems.size} of ${state.modelInteractions.size} calls (newest first).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF64748B),
+                )
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = MODEL_JOURNAL_SCROLL_MAX_HEIGHT)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    journalItems.forEach { item ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
                         ) {
-                            Text(
-                                text = "${item.timestampLabel} | ${item.trigger} | ${item.modelLabel}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF334155),
-                                fontWeight = FontWeight.Medium,
-                            )
-                            Text(
-                                text = "Status: ${item.status}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF64748B),
-                            )
-                            Text(
-                                text = "Prompt:\n${item.prompt.ifBlank { "<empty>" }}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF334155),
-                            )
-                            Text(
-                                text = "Response:\n${item.response.ifBlank { "<empty>" }}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF334155),
-                            )
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Text(
+                                    text = "${item.timestampLabel} | ${item.trigger} | ${item.modelLabel}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF334155),
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    text = "Status: ${item.status}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF64748B),
+                                )
+                                Text(
+                                    text = "Prompt:\n${item.prompt.ifBlank { "<empty>" }}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF334155),
+                                )
+                                Text(
+                                    text = "Response:\n${item.response.ifBlank { "<empty>" }}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF334155),
+                                )
+                            }
                         }
                     }
                 }
@@ -1203,6 +1682,7 @@ private fun ModelInteractionJournalCard(
 private fun AssistantSessionTableCard(
     state: PermissionCommandCenterState,
     onGenerate: () -> Unit,
+    onOpenQuickAction: (AssistantQuickAction) -> Unit,
 ) {
     Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
         Column(
@@ -1248,9 +1728,133 @@ private fun AssistantSessionTableCard(
                 ) {
                     SessionTableHeaderRow()
                     state.assistantSessionRows.forEach { row ->
-                        SessionTableDataRow(row)
+                        SessionTableDataRow(
+                            row = row,
+                            onOpenQuickAction = onOpenQuickAction,
+                        )
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ManualSpeechIntakeCard(
+    running: Boolean,
+    status: String,
+    latestTranscript: String,
+    onPressStart: () -> Unit,
+    onPressEnd: () -> Unit,
+) {
+    val canStartState by rememberUpdatedState(!running)
+    val onPressStartState by rememberUpdatedState(onPressStart)
+    val onPressEndState by rememberUpdatedState(onPressEnd)
+    val infiniteTransition = rememberInfiniteTransition(label = "manualSpeechBreathing")
+    val breathingScale by infiniteTransition.animateFloat(
+        initialValue = 0.96f,
+        targetValue = 1.06f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 920, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "manualSpeechBreathingScale",
+    )
+    val targetScale = if (running) breathingScale else 1f
+    val buttonBg by animateColorAsState(
+        targetValue = if (running) Color(0xFF22C55E) else Color.White,
+        label = "manualSpeechButtonBg",
+    )
+    val buttonBorder by animateColorAsState(
+        targetValue = when {
+            running -> Color(0xFF16A34A)
+            else -> Color(0xFF0EA5E9)
+        },
+        label = "manualSpeechButtonBorder",
+    )
+    val buttonTextColor by animateColorAsState(
+        targetValue = when {
+            running -> Color.White
+            else -> Color(0xFF0369A1)
+        },
+        label = "manualSpeechButtonTextColor",
+    )
+
+    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(168.dp)
+                    .graphicsLayer {
+                        scaleX = targetScale
+                        scaleY = targetScale
+                    }
+                    .background(color = buttonBg, shape = CircleShape)
+                    .border(width = 3.dp, color = buttonBorder, shape = CircleShape)
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            if (!canStartState) return@awaitEachGesture
+                            down.consume()
+                            onPressStartState()
+                            try {
+                                var released = false
+                                while (!released) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull { it.id == down.id } ?: event.changes.firstOrNull()
+                                    if (change == null) continue
+                                    change.consume()
+                                    released = !change.pressed
+                                }
+                            } finally {
+                                onPressEndState()
+                            }
+                        }
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = when {
+                        running -> "LISTENING\nRELEASE TO STOP"
+                        else -> "Anything"
+                    },
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = buttonTextColor,
+                )
+            }
+            Text(
+                text = status,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF475569),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            if (latestTranscript.isNotBlank()) {
+                Text(
+                    text = "Latest Intake Transcript",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF0F172A),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    text = latestTranscript,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF0F172A),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(
+                            color = Color(0xFFF8FAFC),
+                            shape = RoundedCornerShape(10.dp),
+                        )
+                        .padding(10.dp),
+                )
             }
         }
     }
@@ -1272,13 +1876,17 @@ private fun SessionTableHeaderRow() {
         SessionTableCell("Location", 170.dp, header = true)
         SessionTableCell("Calendar", 180.dp, header = true)
         SessionTableCell("Guessed User Scenario", 260.dp, header = true)
-        SessionTableCell("Action Plan", 300.dp, header = true)
+        SessionTableCell("Action Plan", 260.dp, header = true)
+        SessionTableCell("Quick Actions", 250.dp, header = true)
         SessionTableCell("Model", 170.dp, header = true)
     }
 }
 
 @Composable
-private fun SessionTableDataRow(row: AssistantSessionRowUiState) {
+private fun SessionTableDataRow(
+    row: AssistantSessionRowUiState,
+    onOpenQuickAction: (AssistantQuickAction) -> Unit,
+) {
     Column {
         Row(
             modifier = Modifier.padding(vertical = 4.dp),
@@ -1286,17 +1894,100 @@ private fun SessionTableDataRow(row: AssistantSessionRowUiState) {
         ) {
             SessionTableCell(row.sessionLabel, 120.dp)
             SessionTableCell(row.eventCount.toString(), 70.dp)
-            SessionTableCell(row.speechSummary, 210.dp)
+            SessionTableCell(
+                text = row.speechSummary,
+                width = 210.dp,
+                maxLines = Int.MAX_VALUE,
+                scrollable = true,
+                scrollMaxHeight = 200.dp,
+            )
             SessionTableCell(row.positionSummary, 165.dp)
             SessionTableCell(row.indoorOutdoor, 120.dp)
             SessionTableCell(row.locationLabel, 170.dp)
             SessionTableCell(row.calendarSummary, 180.dp)
             SessionTableCell(row.guessedUserScenario, 260.dp, maxLines = 8)
-            SessionTableCell(row.actionPlan, 300.dp, maxLines = 8)
+            SessionTableCell(row.actionPlan, 260.dp, maxLines = 8)
+            SessionTableQuickActionsCell(
+                actions = row.quickActions,
+                width = 250.dp,
+                onOpen = onOpenQuickAction,
+            )
             SessionTableCell(row.modelLabel, 170.dp)
         }
         HorizontalDivider(color = Color(0xFFE2E8F0))
     }
+}
+
+@Composable
+private fun SessionTableQuickActionsCell(
+    actions: List<AssistantQuickAction>,
+    width: Dp,
+    onOpen: (AssistantQuickAction) -> Unit,
+) {
+    if (actions.isEmpty()) {
+        SessionTableCell("-", width = width)
+        return
+    }
+
+    Column(
+        modifier = Modifier
+            .width(width)
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        actions.take(4).forEach { action ->
+            OutlinedButton(
+                onClick = { onOpen(action) },
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(
+                    start = 8.dp,
+                    end = 8.dp,
+                    top = 4.dp,
+                    bottom = 4.dp,
+                ),
+            ) {
+                Text(
+                    text = compactQuickActionButtonLabel(action.label),
+                    maxLines = 1,
+                    overflow = TextOverflow.Clip,
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontSize = 11.sp,
+                        lineHeight = 12.sp,
+                    ),
+                    softWrap = false,
+                )
+            }
+        }
+    }
+}
+
+private fun compactQuickActionButtonLabel(raw: String): String {
+    if (raw.isBlank()) return "Open"
+    val cleaned = raw
+        .replace(Regex("\\s+"), " ")
+        .replace(Regex("(?i)\\b(ai|immediately|current|context|device|please|kindly)\\b"), "")
+        .replace("立刻", "")
+        .replace("立即", "")
+        .replace("当前", "")
+        .replace("请", "")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+    if (cleaned.isBlank()) return "Open"
+    val hasChinese = cleaned.any { it.code in 0x4E00..0x9FFF }
+    return if (hasChinese) {
+        cleaned
+            .replace(Regex("[，。！？、；：]+"), "")
+            .take(12)
+            .trim()
+    } else {
+        val compact = cleaned
+            .split(' ')
+            .filter { it.isNotBlank() }
+            .take(4)
+            .joinToString(" ")
+            .trim()
+        compact.take(24).trim()
+    }.ifBlank { "Open" }
 }
 
 @Composable
@@ -1305,9 +1996,40 @@ private fun SessionTableCell(
     width: Dp,
     header: Boolean = false,
     maxLines: Int = 4,
+    scrollable: Boolean = false,
+    scrollMaxHeight: Dp = 180.dp,
 ) {
+    val resolvedText = text.ifBlank { "-" }
+    if (scrollable && !header) {
+        val scrollState = rememberScrollState()
+        Box(
+            modifier = Modifier
+                .width(width)
+                .padding(horizontal = 8.dp, vertical = 4.dp)
+                .heightIn(min = 84.dp, max = scrollMaxHeight)
+                .background(
+                    color = Color(0xFFF8FAFC),
+                    shape = RoundedCornerShape(10.dp),
+                )
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+        ) {
+            Text(
+                text = resolvedText,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(scrollState),
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.Normal,
+                color = Color(0xFF334155),
+                maxLines = Int.MAX_VALUE,
+                overflow = TextOverflow.Clip,
+            )
+        }
+        return
+    }
+
     Text(
-        text = text.ifBlank { "-" },
+        text = resolvedText,
         modifier = Modifier
             .width(width)
             .padding(horizontal = 8.dp, vertical = 4.dp),
@@ -1317,6 +2039,253 @@ private fun SessionTableCell(
         maxLines = if (header) 1 else maxLines,
         overflow = TextOverflow.Ellipsis,
     )
+}
+
+private data class InAppQuickActionUrl(
+    val url: String,
+    val aiMode: Boolean,
+)
+
+private fun resolveInAppQuickActionUrl(rawUrl: String): InAppQuickActionUrl {
+    val trimmed = rawUrl.trim()
+    if (trimmed.isBlank()) return InAppQuickActionUrl(url = "https://www.google.com", aiMode = false)
+    val parsed = kotlin.runCatching { Uri.parse(trimmed) }.getOrNull()
+        ?: return InAppQuickActionUrl(url = trimmed, aiMode = false)
+
+    val host = parsed.host?.lowercase(Locale.US).orEmpty()
+    val path = parsed.path.orEmpty()
+    val isGoogle = host.contains("google.")
+
+    if (isGoogle && path.startsWith("/search")) {
+        val query = parsed.getQueryParameter("q").orEmpty().trim()
+        if (query.isNotBlank()) {
+            return InAppQuickActionUrl(
+                url = "https://www.google.com/search?udm=50&q=${encodeQuery(query)}",
+                aiMode = true,
+            )
+        }
+    }
+
+    if (isGoogle && path.startsWith("/maps/search")) {
+        val query = parsed.getQueryParameter("query").orEmpty().trim()
+        if (query.isNotBlank()) {
+            return InAppQuickActionUrl(
+                url = "https://www.google.com/search?udm=50&q=${encodeQuery(query)}",
+                aiMode = true,
+            )
+        }
+    }
+
+    if (isGoogle && path.contains("/travel/", ignoreCase = true)) {
+        val q = listOf(
+            parsed.getQueryParameter("q"),
+            parsed.getQueryParameter("destination"),
+        ).firstOrNull { !it.isNullOrBlank() }?.trim().orEmpty()
+        if (q.isNotBlank()) {
+            return InAppQuickActionUrl(
+                url = "https://www.google.com/search?udm=50&q=${encodeQuery(q)}",
+                aiMode = true,
+            )
+        }
+    }
+
+    return InAppQuickActionUrl(url = trimmed, aiMode = false)
+}
+
+private fun encodeQuery(input: String): String {
+    return URLEncoder.encode(input, Charsets.UTF_8.name())
+}
+
+@Composable
+private fun InAppAiSearchDialog(
+    title: String,
+    url: String,
+    aiMode: Boolean,
+    onDismiss: () -> Unit,
+) {
+    var webView by remember { mutableStateOf<WebView?>(null) }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = title.ifBlank { "AI Search" },
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = if (aiMode) "AI Mode Search (In-App)" else "In-App Preview",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (aiMode) Color(0xFF0F766E) else Color(0xFF64748B),
+                        )
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { webView?.reload() }) {
+                            Text("Reload")
+                        }
+                        TextButton(onClick = onDismiss) {
+                            Text("Close")
+                        }
+                    }
+                }
+
+                Text(
+                    text = url,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF475569),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+
+                AndroidView(
+                    factory = { ctx ->
+                        WebView(ctx).apply {
+                            settings.javaScriptEnabled = true
+                            settings.domStorageEnabled = true
+                            settings.loadsImagesAutomatically = true
+                            settings.mediaPlaybackRequiresUserGesture = true
+                            settings.userAgentString = "${settings.userAgentString} ProactiveAI-InAppWebView/1.0"
+                            webChromeClient = WebChromeClient()
+                            webViewClient = object : WebViewClient() {}
+                            loadUrl(url)
+                            webView = this
+                        }
+                    },
+                    update = { view ->
+                        if (view.url.isNullOrBlank()) {
+                            view.loadUrl(url)
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 420.dp, max = 760.dp),
+                )
+            }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            kotlin.runCatching { webView?.stopLoading() }
+            kotlin.runCatching { webView?.destroy() }
+            webView = null
+        }
+    }
+}
+
+@Composable
+private fun AssistantDiaryListCard(
+    rows: List<FourHourDiaryRow>,
+    status: String,
+    onRefresh: () -> Unit,
+) {
+    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "12-Hour Assistant Diary",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                OutlinedButton(onClick = onRefresh) {
+                    Text("Refresh")
+                }
+            }
+
+            Text(
+                text = status,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF64748B),
+            )
+
+            if (rows.isEmpty()) {
+                Text(
+                    text = "No diary rows yet.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF64748B),
+                )
+            } else {
+                val xScrollState = rememberScrollState()
+                val yScrollState = rememberScrollState()
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = ASSISTANT_DIARY_SCROLL_MAX_HEIGHT)
+                        .verticalScroll(yScrollState)
+                        .horizontalScroll(xScrollState),
+                    verticalArrangement = Arrangement.spacedBy(0.dp),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .background(Color(0xFFE2E8F0))
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        SessionTableCell("Window", 130.dp, header = true)
+                        SessionTableCell("Summary", 260.dp, header = true)
+                        SessionTableCell("Proactive AI Can Help", 260.dp, header = true)
+                        SessionTableCell("Self TODO", 240.dp, header = true)
+                    }
+
+                    rows.forEach { row ->
+                        Row(
+                            modifier = Modifier.padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.Top,
+                        ) {
+                            SessionTableCell(row.windowLabel, 130.dp, maxLines = 3)
+                            SessionTableCell(
+                                row.summary,
+                                260.dp,
+                                maxLines = Int.MAX_VALUE,
+                                scrollable = true,
+                                scrollMaxHeight = 220.dp,
+                            )
+                            SessionTableCell(
+                                row.proactiveHelp,
+                                260.dp,
+                                maxLines = Int.MAX_VALUE,
+                                scrollable = true,
+                                scrollMaxHeight = 220.dp,
+                            )
+                            SessionTableCell(
+                                row.selfTodo,
+                                240.dp,
+                                maxLines = Int.MAX_VALUE,
+                                scrollable = true,
+                                scrollMaxHeight = 220.dp,
+                            )
+                        }
+                        HorizontalDivider(color = Color(0xFFE2E8F0))
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -1670,9 +2639,11 @@ private fun LocalModelConfigDialog(
     enabled: Boolean,
     path2B: String,
     path4B: String,
+    openAiApiKey: String,
     onEnabledChange: (Boolean) -> Unit,
     onPath2BChange: (String) -> Unit,
     onPath4BChange: (String) -> Unit,
+    onOpenAiApiKeyChange: (String) -> Unit,
     onDismiss: () -> Unit,
     onSave: () -> Unit,
 ) {
@@ -1725,6 +2696,18 @@ private fun LocalModelConfigDialog(
                     text = "Example path: /data/user/0/com.proactiveai.extreme/files/models/gemma-4-E2B-it.litertlm",
                     style = MaterialTheme.typography.bodySmall,
                     color = Color(0xFF64748B),
+                )
+                Text(
+                    text = "Cloud STT (15-min refine via gpt-4o-transcribe):",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF64748B),
+                )
+                TextField(
+                    value = openAiApiKey,
+                    onValueChange = onOpenAiApiKeyChange,
+                    label = { Text("OpenAI API key (sk-...)") },
+                    minLines = 1,
+                    modifier = Modifier.fillMaxWidth(),
                 )
             }
         },
@@ -2080,10 +3063,12 @@ private fun AudioClipDebugCard(
     state: PermissionCommandCenterState,
     activeClipPath: String,
     replayRunning: Boolean,
+    cloudTranscribeRunning: Boolean,
     onRefresh: () -> Unit,
     onReplayLatest: () -> Unit,
     onClear: () -> Unit,
     onReplaySingle: (String) -> Unit,
+    onCloudTranscribeSingle: (String) -> Unit,
     onPlayOrStop: (String) -> Unit,
 ) {
     val clipItems = state.audioClips.take(CONTEXT_CARD_MAX_ITEMS)
@@ -2194,6 +3179,20 @@ private fun AudioClipDebugCard(
                                         color = Color(0xFF0F766E),
                                     )
                                 }
+                                if (clip.refinedStatus.isNotBlank()) {
+                                    Text(
+                                        text = "cloud refine status: ${clip.refinedStatus}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = if (clip.refinedStatus == "recognized") Color(0xFF15803D) else Color(0xFFB45309),
+                                    )
+                                }
+                                if (clip.refinedTranscript.isNotBlank()) {
+                                    Text(
+                                        text = "cloud transcript: ${clip.refinedTranscript}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color(0xFF1D4ED8),
+                                    )
+                                }
                                 Text(
                                     text = clip.filePath,
                                     style = MaterialTheme.typography.bodySmall,
@@ -2216,6 +3215,12 @@ private fun AudioClipDebugCard(
                                         enabled = !replayRunning,
                                     ) {
                                         Text("Re-run")
+                                    }
+                                    OutlinedButton(
+                                        onClick = { onCloudTranscribeSingle(clip.filePath) },
+                                        enabled = !cloudTranscribeRunning,
+                                    ) {
+                                        Text(if (cloudTranscribeRunning) "GPT..." else "GPT Transcribe")
                                     }
                                 }
                             }
@@ -2369,6 +3374,8 @@ private fun ExecutionQueueCard(
     state: PermissionCommandCenterState,
     onRefresh: () -> Unit,
     onRunNow: () -> Unit,
+    onGenerateDailyFocus: () -> Unit,
+    generatingDailyFocus: Boolean,
     onRetry: (Long) -> Unit,
     onClearSucceeded: () -> Unit,
 ) {
@@ -2404,6 +3411,12 @@ private fun ExecutionQueueCard(
                 OutlinedButton(onClick = onRunNow) {
                     Text("Run Now")
                 }
+                OutlinedButton(
+                    onClick = onGenerateDailyFocus,
+                    enabled = !generatingDailyFocus,
+                ) {
+                    Text(if (generatingDailyFocus) "Generating..." else "Generate Focus Top3")
+                }
                 OutlinedButton(onClick = onClearSucceeded) {
                     Text("Clear Done")
                 }
@@ -2416,42 +3429,66 @@ private fun ExecutionQueueCard(
                     color = Color(0xFF64748B),
                 )
             } else {
-                state.executionQueue.forEach { item ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                val visibleQueueItems = state.executionQueue.take(EXECUTION_QUEUE_RENDER_MAX_ITEMS)
+                if (state.executionQueue.size > visibleQueueItems.size) {
+                    Text(
+                        text = "Showing latest ${visibleQueueItems.size} / ${state.executionQueue.size} items",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF64748B),
+                    )
+                }
+                val queueScrollState = rememberScrollState()
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = EXECUTION_QUEUE_SCROLL_MAX_HEIGHT)
+                        .verticalScroll(queueScrollState),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    visibleQueueItems.forEach { item ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
                         ) {
-                            Text(
-                                text = item.summary,
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.Medium,
-                            )
-                            Text(
-                                text = "Status=${item.status} Attempts=${item.attempts} Updated=${item.updatedAtLabel}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF64748B),
-                            )
-                            item.nextRetryLabel?.let {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
                                 Text(
-                                    text = "Next retry: $it",
+                                    text = item.summary,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                item.detail?.let { detail ->
+                                    Text(
+                                        text = detail,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color(0xFF334155),
+                                    )
+                                }
+                                Text(
+                                    text = "Status=${item.status} Attempts=${item.attempts} Updated=${item.updatedAtLabel}",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = Color(0xFF64748B),
                                 )
-                            }
-                            item.lastError?.let {
-                                Text(
-                                    text = "Error: $it",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFFB91C1C),
-                                )
-                            }
-                            if (item.status == "FAILED") {
-                                OutlinedButton(onClick = { onRetry(item.id) }) {
-                                    Text("Retry")
+                                item.nextRetryLabel?.let {
+                                    Text(
+                                        text = "Next retry: $it",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color(0xFF64748B),
+                                    )
+                                }
+                                item.lastError?.let {
+                                    Text(
+                                        text = "Error: $it",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color(0xFFB91C1C),
+                                    )
+                                }
+                                if (item.status == "FAILED") {
+                                    OutlinedButton(onClick = { onRetry(item.id) }) {
+                                        Text("Retry")
+                                    }
                                 }
                             }
                         }
@@ -2689,6 +3726,27 @@ private data class FifteenMinuteSession(
     val events: List<ContextEventPayload>,
 )
 
+private data class FourHourDiaryRow(
+    val windowLabel: String,
+    val summary: String,
+    val proactiveHelp: String,
+    val selfTodo: String,
+)
+
+private data class FourHourDiaryWindow(
+    val startMs: Long,
+    val endMs: Long,
+    val allEvents: List<ContextEventPayload>,
+    val events: List<ContextEventPayload>,
+    val snapshot: SessionContextSnapshot,
+)
+
+private data class FourHourDiaryParsed(
+    val summary: String,
+    val proactiveHelp: String,
+    val selfTodo: String,
+)
+
 private data class SessionContextSnapshot(
     val speechSummary: String,
     val positionSummary: String,
@@ -2708,6 +3766,569 @@ private data class SessionHeuristicGuess(
 )
 
 private const val ASSISTANT_SESSION_WINDOW_MS = 15 * 60 * 1000L
+
+private fun buildFourHourDiaryRows(
+    context: android.content.Context,
+    events: List<ContextEventPayload>,
+    maxRows: Int,
+    model: EdgeModelProfile,
+    runtimeConfig: LocalModelRuntimeConfig,
+    onTrace: (EdgeInferenceTrace, Int) -> Unit,
+): List<FourHourDiaryRow> {
+    if (events.isEmpty()) return emptyList()
+    val contextOnly = events.filterNot {
+        it.source == "local_model" ||
+            it.category == "model_io" ||
+            it.category == "assistant_session"
+    }
+    if (contextOnly.isEmpty()) return emptyList()
+
+    val todayStart = startOfTodayMs()
+    val scoped = contextOnly.filter { it.occurredAt >= todayStart }.ifEmpty { contextOnly }
+
+    val windows = scoped
+        .groupBy { event -> (event.occurredAt / ASSISTANT_DIARY_WINDOW_MS) * ASSISTANT_DIARY_WINDOW_MS }
+        .entries
+        .sortedByDescending { it.key }
+        .take(maxRows)
+        .map { (startMs, groupedEvents) ->
+            val ordered = groupedEvents.sortedByDescending { it.occurredAt }
+            val signal = selectDiarySignalEvents(ordered).ifEmpty { ordered.take(24) }
+            FourHourDiaryWindow(
+                startMs = startMs,
+                endMs = startMs + ASSISTANT_DIARY_WINDOW_MS,
+                allEvents = ordered,
+                events = signal,
+                snapshot = buildSessionContextSnapshot(
+                    context = context,
+                    events = ordered,
+                    maxSpeechSegments = 36,
+                ),
+            )
+        }
+
+    return windows.map { window ->
+        val fallback = buildFourHourFallbackDiary(
+            events = window.events,
+            snapshot = window.snapshot,
+        )
+        val windowLabel = formatSessionRange(window.startMs, window.endMs)
+        val prompt = buildFourHourDiaryPrompt(
+            windowLabel = windowLabel,
+            snapshot = window.snapshot,
+            events = window.events,
+            allEvents = window.allEvents,
+        )
+        val trace = OnDeviceInferenceEngine.inferFromPromptWithTrace(
+            context = context,
+            model = model,
+            prompt = prompt,
+            runtimeConfig = runtimeConfig,
+        )
+        onTrace(trace, window.events.size)
+
+        val result = trace.result
+        val raw = result.nativeModelOutput?.trim().takeIf { !it.isNullOrBlank() } ?: result.summary
+        val parsed = parseFourHourDiaryOutput(
+            output = raw,
+            fallback = fallback,
+            preferFallback = !result.nativeModelUsed,
+        )
+        FourHourDiaryRow(
+            windowLabel = windowLabel,
+            summary = parsed.summary,
+            proactiveHelp = parsed.proactiveHelp,
+            selfTodo = parsed.selfTodo,
+        )
+    }
+}
+
+private fun buildFourHourDiaryPrompt(
+    windowLabel: String,
+    snapshot: SessionContextSnapshot,
+    events: List<ContextEventPayload>,
+    allEvents: List<ContextEventPayload>,
+): String {
+    val speechEvidence = extractDiarySpeechEvidence(allEvents, maxItems = 36)
+    val speechDigest = speechEvidence
+        .asSequence()
+        .map { sanitizeDiaryNarrativeLine(it) }
+        .filter { it.isNotBlank() && !looksLikeTechnicalDiaryLine(it) }
+        .distinctBy { it.lowercase(Locale.US) }
+        .take(32)
+        .joinToString(separator = "\n") { "- $it" }
+        .ifBlank { "- 无有效语音转录证据" }
+
+    val eventsDigest = events
+        .asSequence()
+        .map { sanitizeDiaryNarrativeLine(it.summary) }
+        .filter { it.isNotBlank() && !looksLikeTechnicalDiaryLine(it) }
+        .distinctBy { it.lowercase(Locale.US) }
+        .take(24)
+        .joinToString(separator = "\n") { "- $it" }
+        .ifBlank { "- 暂无足够强的非技术事件证据" }
+
+    return """
+        你是运行在手机端的主动AI秘书。
+        请针对一个12小时窗口，写“发生了什么”的个人日记，不要写事件计数统计，不要写系统采集过程。
+        输出必须基于证据；如果不确定请明确说“证据不足/不确定”。
+        语气要求：像写给用户自己的日记，具体自然、避免技术腔。
+        长度要求：按证据丰富度动态调整。内容少就短写；内容丰富就写得更完整。
+        如果语音证据中有具体、个人化表达（例如真实想法、具体计划、情绪、人物/地点），请保留1-3句原话（可加引号）以增强真实感。
+        其余重复或泛化内容请合并总结，避免流水账。
+        严禁输出技术字段或系统日志词，例如：
+        events= / category= / source= / status= / payload / lat= / lon= / wifi= / cellular= / context tick / processed / strategy / model / backend。
+        若原始证据含这些词，请改写成人类可读叙述。
+
+        窗口: $windowLabel
+        语音线索: ${snapshot.speechSummary}
+        语音转录证据(高优先级):
+        $speechDigest
+        位置线索: ${snapshot.positionSummary}
+        室内外: ${snapshot.indoorOutdoor}
+        地点: ${snapshot.locationLabel}
+        日程线索: ${snapshot.calendarSummary}
+        关键事件:
+        $eventsDigest
+
+        严格按以下格式输出（纯文本）:
+        Diary Summary: <3-8句，像日记，描述这12小时具体发生了什么；有个人细节就保留>
+        Proactive AI Can Help:
+        - <我可以立刻帮你的事情1>
+        - <我可以立刻帮你的事情2>
+        - <可选第三项>
+        Self TODO:
+        - <你该给自己的待办1>
+        - <你该给自己的待办2>
+        - <可选第三项>
+    """.trimIndent()
+}
+
+private fun buildFourHourFallbackDiary(
+    events: List<ContextEventPayload>,
+    snapshot: SessionContextSnapshot,
+): FourHourDiaryParsed {
+    return FourHourDiaryParsed(
+        summary = buildFourHourSummary(events, snapshot),
+        proactiveHelp = buildFourHourProactiveHelp(events, snapshot),
+        selfTodo = buildFourHourSelfTodo(events, snapshot),
+    )
+}
+
+private fun parseFourHourDiaryOutput(
+    output: String,
+    fallback: FourHourDiaryParsed,
+    preferFallback: Boolean,
+): FourHourDiaryParsed {
+    if (preferFallback) return fallback
+    val cleaned = output.trim()
+    if (cleaned.isBlank()) return fallback
+
+    val lines = cleaned
+        .lines()
+        .map { it.trim() }
+        .filter { it.isNotBlank() && !it.startsWith("```") }
+    if (lines.isEmpty()) return fallback
+
+    var section = "summary"
+    val summaryLines = mutableListOf<String>()
+    val helpLines = mutableListOf<String>()
+    val todoLines = mutableListOf<String>()
+
+    lines.forEach { line ->
+        val lower = line.lowercase(Locale.US)
+        val summaryHeader = lower.startsWith("diary summary") || lower.startsWith("summary:") || lower.startsWith("日记总结") || lower.startsWith("总结:")
+        val helpHeader = lower.startsWith("proactive ai can help") || lower.startsWith("proactive help") || lower.contains("能帮忙") || lower.startsWith("可帮")
+        val todoHeader = lower.startsWith("self todo") || lower.startsWith("todo:") || lower.contains("给自己的待办") || lower.startsWith("待办")
+
+        when {
+            summaryHeader -> {
+                section = "summary"
+                val inline = line.substringAfter(":", "").substringAfter("：", "").trim()
+                if (inline.isNotBlank()) summaryLines += inline
+                return@forEach
+            }
+
+            helpHeader -> {
+                section = "help"
+                val inline = line.substringAfter(":", "").substringAfter("：", "").trim()
+                if (inline.isNotBlank()) helpLines += normalizeActionLine(inline)
+                return@forEach
+            }
+
+            todoHeader -> {
+                section = "todo"
+                val inline = line.substringAfter(":", "").substringAfter("：", "").trim()
+                if (inline.isNotBlank()) todoLines += normalizeActionLine(inline)
+                return@forEach
+            }
+        }
+
+        when (section) {
+            "summary" -> summaryLines += line
+            "help" -> helpLines += normalizeActionLine(line)
+            "todo" -> todoLines += normalizeActionLine(line)
+        }
+    }
+
+    val summaryCandidate = summaryLines
+        .asSequence()
+        .map { sanitizeDiaryNarrativeLine(it) }
+        .filter { it.isNotBlank() && !looksLikeCounterSummary(it) && !looksLikeTechnicalDiaryLine(it) }
+        .distinct()
+        .take(8)
+        .joinToString(separator = " ")
+        .ifBlank { fallback.summary }
+    val summary = summaryCandidate.take(diarySummaryCharLimit(summaryCandidate))
+
+    val proactiveHelpCandidate = helpLines
+        .asSequence()
+        .map { normalizeActionLine(it) }
+        .map { sanitizeDiaryNarrativeLine(it) }
+        .filter { it.length >= 8 && !looksLikeCounterSummary(it) && !looksLikeTechnicalDiaryLine(it) }
+        .distinct()
+        .take(3)
+        .joinToString(separator = " | ")
+        .ifBlank { fallback.proactiveHelp }
+    val proactiveHelp = proactiveHelpCandidate.take(diaryActionCharLimit(proactiveHelpCandidate))
+
+    val selfTodoCandidate = todoLines
+        .asSequence()
+        .map { normalizeActionLine(it) }
+        .map { sanitizeDiaryNarrativeLine(it) }
+        .filter { it.length >= 8 && !looksLikeCounterSummary(it) && !looksLikeTechnicalDiaryLine(it) }
+        .distinct()
+        .take(3)
+        .joinToString(separator = " | ")
+        .ifBlank { fallback.selfTodo }
+    val selfTodo = selfTodoCandidate.take(diaryActionCharLimit(selfTodoCandidate))
+
+    return FourHourDiaryParsed(
+        summary = summary,
+        proactiveHelp = proactiveHelp,
+        selfTodo = selfTodo,
+    )
+}
+
+private fun selectDiarySignalEvents(events: List<ContextEventPayload>): List<ContextEventPayload> {
+    val blockedCategories = setOf("context_log", "model_io", "assistant_session", "audio_gate")
+    val filtered = events
+        .asSequence()
+        .filterNot { it.category.lowercase(Locale.US) in blockedCategories }
+        .filterNot { it.source.equals("collection_service", ignoreCase = true) && it.category.equals("device_state", ignoreCase = true) }
+        .filterNot { it.summary.startsWith("1m context tick", ignoreCase = true) }
+        .toList()
+    if (filtered.isEmpty()) return emptyList()
+
+    val speechPreferred = selectPreferredSpeechEvents(filtered)
+    val speechIds = speechPreferred.map { it.eventId }.toSet()
+
+    val nonSpeech = filtered
+        .asSequence()
+        .filterNot { it.eventId in speechIds }
+        .take((24 - speechPreferred.size).coerceAtLeast(0))
+        .toList()
+
+    return (speechPreferred + nonSpeech)
+        .sortedByDescending { it.occurredAt }
+        .take(36)
+}
+
+private fun selectPreferredSpeechEvents(events: List<ContextEventPayload>): List<ContextEventPayload> {
+    val bestByClip = linkedMapOf<String, Pair<ContextEventPayload, SpeechSignal>>()
+    events.forEach { event ->
+        val signal = extractSpeechSignal(event) ?: return@forEach
+        val existing = bestByClip[signal.clipKey]
+        if (existing == null) {
+            bestByClip[signal.clipKey] = event to signal
+            return@forEach
+        }
+        val existingSignal = existing.second
+        val shouldReplace = signal.priority > existingSignal.priority ||
+            (signal.priority == existingSignal.priority && signal.occurredAt > existingSignal.occurredAt)
+        if (shouldReplace) {
+            bestByClip[signal.clipKey] = event to signal
+        }
+    }
+
+    return bestByClip.values
+        .sortedWith(
+            compareByDescending<Pair<ContextEventPayload, SpeechSignal>> { it.second.priority }
+                .thenByDescending { it.first.occurredAt }
+        )
+        .map { it.first }
+        .take(8)
+}
+
+private fun extractDiarySpeechEvidence(
+    events: List<ContextEventPayload>,
+    maxItems: Int,
+): List<String> {
+    if (events.isEmpty()) return emptyList()
+    val bestByClip = linkedMapOf<String, SpeechSignal>()
+    events.forEach { event ->
+        val signal = extractSpeechSignal(event) ?: return@forEach
+        val existing = bestByClip[signal.clipKey]
+        if (
+            existing == null ||
+            signal.priority > existing.priority ||
+            (signal.priority == existing.priority && signal.occurredAt > existing.occurredAt)
+        ) {
+            bestByClip[signal.clipKey] = signal
+        }
+    }
+
+    return bestByClip.values
+        .sortedWith(
+            compareByDescending<SpeechSignal> { it.priority }
+                .thenByDescending { it.occurredAt }
+        )
+        .asSequence()
+        .map { normalizeSnippet(it.text) }
+        .filter { it.isNotBlank() }
+        .distinctBy { it.lowercase(Locale.US) }
+        .take(maxItems)
+        .toList()
+}
+
+private fun startOfTodayMs(): Long {
+    val calendar = Calendar.getInstance()
+    calendar.set(Calendar.HOUR_OF_DAY, 0)
+    calendar.set(Calendar.MINUTE, 0)
+    calendar.set(Calendar.SECOND, 0)
+    calendar.set(Calendar.MILLISECOND, 0)
+    return calendar.timeInMillis
+}
+
+private fun looksLikeCounterSummary(text: String): Boolean {
+    return looksLikeTechnicalDiaryLine(text)
+}
+
+private fun buildFourHourSummary(
+    events: List<ContextEventPayload>,
+    snapshot: SessionContextSnapshot,
+): String {
+    val locationDigest = humanizeLocationForDiary(
+        locationLabel = snapshot.locationLabel,
+        indoorOutdoor = snapshot.indoorOutdoor,
+    )
+    val speechEvidence = extractDiarySpeechEvidence(events, maxItems = 10)
+        .asSequence()
+        .map { sanitizeDiaryNarrativeLine(it) }
+        .filter { it.isNotBlank() && !looksLikeTechnicalDiaryLine(it) && !isNonSpeechText(it) }
+        .distinctBy { it.lowercase(Locale.US) }
+        .toList()
+    val calendarDigest = sanitizeDiaryNarrativeLine(snapshot.calendarSummary)
+        .takeIf {
+            it.isNotBlank() &&
+                !it.startsWith("No meeting", ignoreCase = true) &&
+                !it.contains("no meeting signal", ignoreCase = true) &&
+                !looksLikeTechnicalDiaryLine(it)
+        }
+    val keyMoments = events
+        .asSequence()
+        .map { sanitizeDiaryNarrativeLine(it.summary) }
+        .filter { it.isNotBlank() && !it.startsWith("1m context tick", ignoreCase = true) && !looksLikeTechnicalDiaryLine(it) }
+        .distinctBy { it.lowercase(Locale.US) }
+        .take(3)
+        .toList()
+    val quoteMoments = speechEvidence.take(2).map { "“${it.take(90)}”" }
+
+    val opening = when {
+        !calendarDigest.isNullOrBlank() ->
+            "这12小时你主要在$locationDigest，围绕“$calendarDigest”推进事情，整体节奏比较明确。"
+        speechEvidence.isNotEmpty() ->
+            "这12小时你主要在$locationDigest，很多注意力放在你口头提到的事项上，状态比较投入。"
+        else ->
+            "这12小时你主要在$locationDigest，整体在持续推进手头事项。"
+    }
+
+    val moments = if (keyMoments.isEmpty()) {
+        ""
+    } else {
+        "比较具体的片段有：${keyMoments.joinToString("；")}。"
+    }
+
+    val quotes = if (quoteMoments.isEmpty()) {
+        ""
+    } else {
+        "你当时的原话里，有这些很具体的表达：${quoteMoments.joinToString("；")}。"
+    }
+
+    val narrative = listOf(opening, moments, quotes)
+        .filter { it.isNotBlank() }
+        .joinToString(" ")
+    return narrative.take(diarySummaryCharLimit(narrative))
+}
+
+private fun humanizeLocationForDiary(
+    locationLabel: String,
+    indoorOutdoor: String,
+): String {
+    val normalizedLocation = sanitizeDiaryNarrativeLine(locationLabel)
+    if (
+        normalizedLocation.isNotBlank() &&
+        !normalizedLocation.startsWith("Unknown", ignoreCase = true) &&
+        !normalizedLocation.startsWith("GPS ", ignoreCase = true) &&
+        !looksLikeTechnicalDiaryLine(normalizedLocation)
+    ) {
+        return normalizedLocation
+    }
+    val indoorOutdoorClean = sanitizeDiaryNarrativeLine(indoorOutdoor)
+    return when {
+        indoorOutdoorClean.contains("Indoor", ignoreCase = true) -> "室内环境"
+        indoorOutdoorClean.contains("Outdoor", ignoreCase = true) -> "户外环境"
+        else -> "你所在的环境"
+    }
+}
+
+private fun sanitizeDiaryNarrativeLine(raw: String): String {
+    if (raw.isBlank()) return ""
+    var cleaned = raw.trim()
+    cleaned = cleaned
+        .replace(Regex("^[\\-•*\\d\\.)\\s]+"), "")
+        .replace(Regex("^\\[[^\\]]+\\]\\s*"), "")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+    return cleaned.take(220)
+}
+
+private fun looksLikeTechnicalDiaryLine(text: String): Boolean {
+    val lower = text.trim().lowercase(Locale.US)
+    if (lower.isBlank()) return true
+    if (
+        lower.startsWith("<empty>") ||
+        lower.startsWith("<none>") ||
+        lower.startsWith("no speech transcript") ||
+        lower.startsWith("no meeting signal")
+    ) {
+        return true
+    }
+    if (Regex("""\b[a-z_]{2,20}\s*=\s*[^,\s]+""").containsMatchIn(lower)) return true
+    if (Regex("""\b(lat|lon|lng|gps|wifi|cellular|bluetooth|payload|strategy|backend|model|status|source|category)\b""")
+            .containsMatchIn(lower)
+    ) {
+        return true
+    }
+    if (Regex("""\b(context tick|processed|session_|event count|events=|top=|api|sdk|json|trace)\b""")
+            .containsMatchIn(lower)
+    ) {
+        return true
+    }
+    return false
+}
+
+private fun buildFourHourProactiveHelp(
+    events: List<ContextEventPayload>,
+    snapshot: SessionContextSnapshot,
+): String {
+    val summaryLower = events.joinToString(" ") { it.summary }.lowercase(Locale.US)
+    val speechLower = snapshot.speechSummary.lowercase(Locale.US)
+    val calendarSignals = events.count { event ->
+        val lower = event.summary.lowercase(Locale.US)
+        event.category.equals("calendar", ignoreCase = true) ||
+            event.category.equals("task", ignoreCase = true) ||
+            containsAny(lower, listOf("meeting", "calendar", "deadline", "agenda", "appointment", "会议", "日程"))
+    }
+    val commSignals = events.count { event ->
+        val lower = event.summary.lowercase(Locale.US)
+        event.category.equals("communication", ignoreCase = true) ||
+            event.category.equals("notification", ignoreCase = true) ||
+            containsAny(lower, listOf("email", "message", "inbox", "slack", "github", "reply", "邮件", "消息"))
+    }
+
+    val actions = mutableListOf<String>()
+    if (calendarSignals > 0) {
+        actions += "先为下一场会议整理3点简报和关联资料，随时可发送。"
+    }
+    if (commSignals > 0) {
+        actions += "把未读消息按优先级排序，并给出可直接发送的回复草稿。"
+    }
+    if (containsAny(summaryLower, listOf("奶茶", "milk tea", "bubble tea", "boba"))) {
+        actions += "直接给出附近奶茶选项和可点击下单/导航入口。"
+    }
+    if (containsAny(speechLower, listOf("buy", "order", "need", "想", "要", "买"))) {
+        actions += "把你口头意图转换成一步可执行动作，减少确认成本。"
+    }
+    if (actions.isEmpty()) {
+        actions += "继续低打扰监控，只在高置信度时给出可执行建议。"
+    }
+    val result = actions.distinct().take(3).joinToString(" | ")
+    return result.take(diaryActionCharLimit(result))
+}
+
+private fun buildFourHourSelfTodo(
+    events: List<ContextEventPayload>,
+    snapshot: SessionContextSnapshot,
+): String {
+    val summaryLower = events.joinToString(" ") { it.summary }.lowercase(Locale.US)
+    val todos = mutableListOf<String>()
+
+    if (containsAny(summaryLower, listOf("meeting", "calendar", "deadline", "会议", "日程"))) {
+        todos += "确认下一场会议目标与必须材料，避免临时准备。"
+    }
+    if (containsAny(summaryLower, listOf("email", "message", "inbox", "slack", "github", "邮件", "消息"))) {
+        todos += "先清掉最高优先级未读沟通，再进入下一任务。"
+    }
+    if (!snapshot.speechSummary.startsWith("No speech", ignoreCase = true)) {
+        todos += "把最近口头想法落成一个可执行下一步。"
+    }
+    if (snapshot.indoorOutdoor.contains("Outdoor", ignoreCase = true) || snapshot.positionSummary.contains("motion=", ignoreCase = true)) {
+        todos += "移动中先做短任务，深度任务留到稳定场景。"
+    }
+    if (todos.isEmpty()) {
+        todos += "写下未来12小时最重要的一件事并设置提醒。"
+    }
+    val result = todos.distinct().take(3).joinToString(" | ")
+    return result.take(diaryActionCharLimit(result))
+}
+
+private fun diarySummaryCharLimit(text: String): Int {
+    if (text.isBlank()) return 520
+    val normalized = text.trim()
+    val lower = normalized.lowercase(Locale.US)
+    val punctuationCount = normalized.count { ch ->
+        ch == '。' || ch == '！' || ch == '？' || ch == '.' || ch == '!' || ch == '?'
+    }
+    val hasQuote = normalized.contains("“") || normalized.contains("”") || normalized.contains("\"")
+    val hasPersonalDetail = containsAny(
+        lower,
+        listOf(
+            "我",
+            "今天",
+            "刚刚",
+            "我们",
+            "朋友",
+            "同事",
+            "客户",
+            "家人",
+            "奶茶",
+            "meeting",
+            "calendar",
+            "deadline",
+            "trip",
+            "restaurant",
+            "flight",
+            "hotel",
+        ),
+    )
+    return when {
+        hasQuote || hasPersonalDetail -> 920
+        punctuationCount >= 6 || normalized.length > 640 -> 840
+        punctuationCount >= 4 || normalized.length > 460 -> 720
+        else -> 560
+    }
+}
+
+private fun diaryActionCharLimit(text: String): Int {
+    if (text.isBlank()) return 360
+    val items = text.split("|").map { it.trim() }.count { it.isNotBlank() }
+    return when {
+        items >= 3 || text.length > 420 -> 520
+        items == 2 -> 420
+        else -> 360
+    }
+}
 
 private fun buildFifteenMinuteSessions(
     events: List<ContextEventPayload>,
@@ -2736,9 +4357,10 @@ private fun buildFifteenMinuteSessions(
 private fun buildSessionContextSnapshot(
     context: android.content.Context,
     events: List<ContextEventPayload>,
+    maxSpeechSegments: Int = 6,
 ): SessionContextSnapshot {
     val ordered = events.sortedByDescending { it.occurredAt }
-    val speechSegments = mutableListOf<String>()
+    val speechSignals = mutableListOf<SpeechSignal>()
     var latitude: Double? = null
     var longitude: Double? = null
     var motionState: String? = null
@@ -2752,20 +4374,7 @@ private fun buildSessionContextSnapshot(
         val categoryLower = event.category.lowercase(Locale.US)
         val summaryLower = event.summary.lowercase(Locale.US)
 
-        if (categoryLower == "audio" || sourceLower.contains("audio")) {
-            val stitched = payloadString(event.payload, "stitchedTranscript")
-            val transcript = payloadString(event.payload, "transcript")
-            val picked = when {
-                !stitched.isNullOrBlank() -> stitched
-                !transcript.isNullOrBlank() -> transcript
-                event.summary.startsWith("Ambient speech transcript:", ignoreCase = true) ->
-                    event.summary.substringAfter(":", "").trim()
-                else -> null
-            }
-            if (!picked.isNullOrBlank()) {
-                speechSegments += picked
-            }
-        }
+        extractSpeechSignal(event)?.let { speechSignals += it }
 
         if (categoryLower == "location" || sourceLower.contains("location")) {
             if (latitude == null) {
@@ -2799,14 +4408,10 @@ private fun buildSessionContextSnapshot(
         }
     }
 
-    val speechSummary = speechSegments
-        .asSequence()
-        .map { normalizeSnippet(it) }
-        .filter { it.isNotBlank() }
-        .distinct()
-        .take(2)
-        .joinToString(separator = " | ")
-        .ifBlank { "No speech transcript in this session" }
+    val speechSummary = buildSpeechSummaryFromSignals(
+        signals = speechSignals,
+        maxSegments = maxSpeechSegments,
+    )
 
     val lat = latitude
     val lon = longitude
@@ -2839,6 +4444,119 @@ private fun buildSessionContextSnapshot(
     )
 }
 
+private data class SpeechSignal(
+    val occurredAt: Long,
+    val clipKey: String,
+    val text: String,
+    val priority: Int,
+)
+
+private fun extractSpeechSignal(event: ContextEventPayload): SpeechSignal? {
+    val sourceLower = event.source.lowercase(Locale.US)
+    val categoryLower = event.category.lowercase(Locale.US)
+    if (categoryLower != "audio" && !sourceLower.contains("audio")) return null
+
+    val status = payloadString(event.payload, "status")?.lowercase(Locale.US).orEmpty()
+    if (status == "no_speech" || status == "error") return null
+
+    val stitched = payloadString(event.payload, "stitchedTranscript")
+    val transcript = payloadString(event.payload, "transcript")
+    val summaryTranscript = if (event.summary.startsWith("Ambient speech transcript", ignoreCase = true)) {
+        event.summary.substringAfter(":", "").trim()
+    } else {
+        ""
+    }
+    val pickedText = listOf(stitched, transcript, summaryTranscript)
+        .firstOrNull { !it.isNullOrBlank() }
+        .orEmpty()
+        .trim()
+    if (pickedText.isBlank() || isNonSpeechText(pickedText)) return null
+
+    val isCloudRefined = payloadBoolean(event.payload, "refinedByCloud") == true ||
+        payloadString(event.payload, "modelStatus")?.contains("cloud_refined", ignoreCase = true) == true ||
+        payloadString(event.payload, "strategy")?.contains("gpt-4o-transcribe", ignoreCase = true) == true ||
+        sourceLower.contains("refiner")
+
+    val clipKey = payloadString(event.payload, "wavPath")
+        ?.ifBlank { null }
+        ?: payloadString(event.payload, "clipOccurredAt")
+            ?.ifBlank { null }
+            ?.let { "clipAt:$it" }
+        ?: "${event.occurredAt}:${pickedText.take(72).lowercase(Locale.US)}"
+
+    return SpeechSignal(
+        occurredAt = event.occurredAt,
+        clipKey = clipKey,
+        text = pickedText,
+        priority = if (isCloudRefined) 2 else 1,
+    )
+}
+
+private fun buildSpeechSummaryFromSignals(
+    signals: List<SpeechSignal>,
+    maxSegments: Int,
+): String {
+    if (signals.isEmpty()) return "No speech transcript in this session"
+
+    val bestByClip = linkedMapOf<String, SpeechSignal>()
+    signals
+        .sortedWith(
+            compareByDescending<SpeechSignal> { it.occurredAt }
+                .thenByDescending { it.priority }
+        )
+        .forEach { signal ->
+            val existing = bestByClip[signal.clipKey]
+            if (
+                existing == null ||
+                signal.priority > existing.priority ||
+                (signal.priority == existing.priority && signal.occurredAt > existing.occurredAt)
+            ) {
+                bestByClip[signal.clipKey] = signal
+            }
+        }
+
+    val normalized = bestByClip.values
+        .sortedWith(
+            compareByDescending<SpeechSignal> { it.occurredAt }
+                .thenByDescending { it.priority }
+        )
+        .asSequence()
+        .map { normalizeSnippet(it.text) }
+        .filter { it.isNotBlank() }
+        .distinctBy { it.lowercase(Locale.US) }
+        .toList()
+
+    if (normalized.isEmpty()) return "No speech transcript in this session"
+
+    val shown = normalized.take(maxSegments)
+    val extra = normalized.size - shown.size
+    return if (extra > 0) {
+        "${shown.joinToString(separator = " | ")} | (+$extra more speech clips)"
+    } else {
+        shown.joinToString(separator = " | ")
+    }
+}
+
+private fun isNonSpeechText(raw: String): Boolean {
+    val lower = raw.trim().lowercase(Locale.US)
+    if (lower.isBlank()) return true
+    if (
+        lower == "<no-speech>" ||
+        lower == "no speech" ||
+        lower == "no_speech" ||
+        lower == "[silence]" ||
+        lower == "silence" ||
+        lower == "empty_or_no_speech"
+    ) {
+        return true
+    }
+    if (lower.startsWith("speech recognizer failed")) return true
+    if (lower.contains("speech_error_")) return true
+    if (lower.contains("no clear speech")) return true
+    if (lower.contains("未识别") || lower.contains("无法识别")) return true
+    return false
+}
+
 private fun buildAssistantPromptForSession(
     session: FifteenMinuteSession,
     snapshot: SessionContextSnapshot,
@@ -2849,6 +4567,12 @@ private fun buildAssistantPromptForSession(
         The answer must be evidence-grounded, not generic.
         You must use at least two evidence signals from speech / calendar / motion / connectivity.
         If mood evidence is weak, state mood as uncertain.
+        Make action steps aggressive and immediately executable in the next 10 minutes.
+        Prefer direct outcomes (book/order/open/contact) over passive suggestions.
+        Only propose domains that are directly supported by session evidence.
+        Do NOT invent unrelated tools/apps/tasks (for example GitHub, calendar prep, Gmail, Slack) unless explicitly supported by speech/calendar/event evidence in this session.
+        If evidence is weak, output fewer steps (1-2) and keep them targeted to the strongest explicit user intent.
+        For each action step, include one concrete endpoint or query target and mention the evidence phrase briefly.
 
         Session window: ${formatSessionRange(session.startMs, session.endMs)}
         Event count: ${session.events.size}
@@ -2912,7 +4636,7 @@ private fun parseSessionInferenceOutput(
         lines.drop(actionHeaderIndex + 1)
             .take(6)
             .mapNotNull { line ->
-                val normalized = line.trimStart('-', '*').trim()
+                val normalized = normalizeActionLine(line)
                 if (normalized.isBlank()) null else normalized
             }
             .take(3)
@@ -3015,6 +4739,11 @@ private fun buildHeuristicScenarioGuess(
     }.take(220)
 
     val actions = mutableListOf<String>()
+    val milkTeaIntent = containsAny(speechLower, listOf("奶茶", "milk tea", "bubble tea", "boba", "茶饮"))
+    if (milkTeaIntent) {
+        actions += "Find top nearby milk tea shops by ETA and rating, then show direct order/search links."
+        actions += "Prepare a default order draft (size, sugar, ice) and ask one-tap confirmation."
+    }
     if (calendarSignals > 0) {
         actions += "Prepare a 3-point brief for the next meeting/task."
         actions += "Surface the most relevant notes/files before the meeting."
@@ -3026,8 +4755,8 @@ private fun buildHeuristicScenarioGuess(
         actions += "Keep interventions short and defer deep tasks until stationary."
     }
     if (actions.isEmpty()) {
-        actions += "Keep passive monitoring and wait for stronger intent signals."
-        actions += "Avoid interrupting unless urgency increases."
+        actions += "Run one targeted search from current context and surface three executable links."
+        actions += "Ask one confirmation question, then execute the highest-confidence next step."
     }
 
     return SessionHeuristicGuess(
@@ -3063,6 +4792,13 @@ private fun isWeakActionPlan(text: String): Boolean {
 
 private fun containsAny(text: String, needles: List<String>): Boolean {
     return needles.any { text.contains(it, ignoreCase = true) }
+}
+
+private fun normalizeActionLine(line: String): String {
+    return line
+        .replace(Regex("^\\s*[-*•]+\\s*"), "")
+        .replace(Regex("^\\s*\\d+[\\).]\\s*"), "")
+        .trim()
 }
 
 private fun formatSessionRange(startMs: Long, endMs: Long): String {

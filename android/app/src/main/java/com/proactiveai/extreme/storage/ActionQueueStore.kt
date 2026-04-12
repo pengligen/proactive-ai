@@ -138,6 +138,14 @@ class ActionQueueStore private constructor(context: Context) :
         )
     }
 
+    fun clearByPlanId(planId: String): Int {
+        return writableDatabase.delete(
+            TABLE_QUEUE,
+            "plan_id = ?",
+            arrayOf(planId),
+        )
+    }
+
     fun countByStatus(status: String): Int {
         val cursor = readableDatabase.rawQuery(
             "SELECT COUNT(1) FROM $TABLE_QUEUE WHERE status = ?",

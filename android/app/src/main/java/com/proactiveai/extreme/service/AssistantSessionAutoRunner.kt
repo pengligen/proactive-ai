@@ -2,6 +2,7 @@ package com.proactiveai.extreme.service
 
 import android.content.Context
 import com.proactiveai.extreme.app.AppPrefs
+import com.proactiveai.extreme.assistant.AssistantQuickActionPlanner
 import com.proactiveai.extreme.core.context.ContextEvent
 import com.proactiveai.extreme.core.context.Sensitivity
 import com.proactiveai.extreme.core.edge.EdgeModelProfile
@@ -22,33 +23,48 @@ object AssistantSessionAutoRunner {
     private const val SESSION_WINDOW_MS = 15 * 60 * 1000L
 
     suspend fun runIfDue(context: Context) {
-        val store = ContextEventStore.getInstance(context)
-        val events = store.getRecent(limit = 1200)
-            .mapNotNull { item ->
-                val payload = safePayloadMap(item.payloadJson)
-                kotlin.runCatching { item.toPayload(payload) }.getOrNull()
-            }
-            .filterNot { event ->
-                event.source == "local_model" || event.category == "model_io" || event.category == "assistant_session"
-            }
-
+        if (AppPrefs.isGlobalLockEnabled(context)) return
+        val events = loadEligibleEvents(context)
         if (events.isEmpty()) return
-
         val latestBucket = events.maxOf { it.occurredAt / SESSION_WINDOW_MS }
-        val lastBucket = AppPrefs.getAssistantLastSessionBucket(context)
-        if (lastBucket >= latestBucket) return
+        runForBucket(context = context, events = events, bucket = latestBucket, force = false)
+    }
 
-        val sessionStartMs = latestBucket * SESSION_WINDOW_MS
+    suspend fun refreshSessionForTimestamp(
+        context: Context,
+        occurredAtMs: Long,
+    ) {
+        if (AppPrefs.isGlobalLockEnabled(context)) return
+        if (occurredAtMs <= 0L) return
+        val events = loadEligibleEvents(context)
+        if (events.isEmpty()) return
+        val bucket = occurredAtMs / SESSION_WINDOW_MS
+        runForBucket(context = context, events = events, bucket = bucket, force = true)
+    }
+
+    private suspend fun runForBucket(
+        context: Context,
+        events: List<ContextEventPayload>,
+        bucket: Long,
+        force: Boolean,
+    ) {
+        val lastBucket = AppPrefs.getAssistantLastSessionBucket(context)
+        if (!force && lastBucket >= bucket) return
+
+        val sessionStartMs = bucket * SESSION_WINDOW_MS
         val sessionEndMs = sessionStartMs + SESSION_WINDOW_MS
         val sessionEvents = events
             .filter { it.occurredAt in sessionStartMs until sessionEndMs }
             .sortedByDescending { it.occurredAt }
 
         if (sessionEvents.isEmpty()) {
-            AppPrefs.setAssistantLastSessionBucket(context, latestBucket)
+            if (!force) {
+                AppPrefs.setAssistantLastSessionBucket(context, maxOf(lastBucket, bucket))
+            }
             return
         }
 
+        val store = ContextEventStore.getInstance(context)
         val snapshot = buildSnapshot(sessionEvents)
         val model = EdgeModelProfile.fromId(AppPrefs.getEdgeModel(context))
         val runtimeConfig = LocalModelRuntimeConfig(
@@ -78,6 +94,14 @@ object AssistantSessionAutoRunner {
             fallbackActionPlan = heuristicGuess.actionPlan,
             preferFallback = !result.nativeModelUsed,
         )
+        val quickActions = AssistantQuickActionPlanner.inferQuickActions(
+            speechSummary = snapshot.speechSummary,
+            guessedUserScenario = parsed.guessedUserScenario,
+            actionPlan = parsed.actionPlan,
+            locationLabel = snapshot.locationLabel,
+            calendarSummary = snapshot.calendarSummary,
+            extraText = raw,
+        )
         val sessionId = "session_$sessionStartMs"
         val sessionLabel = formatSessionRange(sessionStartMs, sessionEndMs)
 
@@ -102,7 +126,9 @@ object AssistantSessionAutoRunner {
                     "guessedUserScenario" to parsed.guessedUserScenario,
                     "suggestion" to parsed.guessedUserScenario,
                     "actionPlan" to parsed.actionPlan,
+                    "quickActions" to AssistantQuickActionPlanner.toPayload(quickActions),
                     "modelLabel" to "${result.model.label} | ${result.strategyLabel}",
+                    "recomputed" to force,
                 ),
                 sensitivity = Sensitivity.HIGH,
                 ttlSeconds = 7 * 24 * 3600,
@@ -131,13 +157,26 @@ object AssistantSessionAutoRunner {
                     "contextEventCount" to sessionEvents.size,
                     "sessionId" to sessionId,
                     "sessionLabel" to sessionLabel,
+                    "recomputed" to force,
                 ),
                 sensitivity = Sensitivity.HIGH,
                 ttlSeconds = 7 * 24 * 3600,
             )
         )
 
-        AppPrefs.setAssistantLastSessionBucket(context, latestBucket)
+        AppPrefs.setAssistantLastSessionBucket(context, maxOf(lastBucket, bucket))
+    }
+
+    private fun loadEligibleEvents(context: Context): List<ContextEventPayload> {
+        val store = ContextEventStore.getInstance(context)
+        return store.getRecent(limit = 1200)
+            .mapNotNull { item ->
+                val payload = safePayloadMap(item.payloadJson)
+                kotlin.runCatching { item.toPayload(payload) }.getOrNull()
+            }
+            .filterNot { event ->
+                event.source == "local_model" || event.category == "model_io" || event.category == "assistant_session"
+            }
     }
 
     private data class Snapshot(
@@ -146,6 +185,13 @@ object AssistantSessionAutoRunner {
         val indoorOutdoor: String,
         val locationLabel: String,
         val calendarSummary: String,
+    )
+
+    private data class SpeechSignal(
+        val occurredAt: Long,
+        val clipKey: String,
+        val text: String,
+        val priority: Int,
     )
 
     private data class Parsed(
@@ -159,7 +205,7 @@ object AssistantSessionAutoRunner {
     )
 
     private fun buildSnapshot(events: List<ContextEventPayload>): Snapshot {
-        val speechSegments = mutableListOf<String>()
+        val speechSignals = mutableListOf<SpeechSignal>()
         var latitude: Double? = null
         var longitude: Double? = null
         var motionState: String? = null
@@ -173,20 +219,7 @@ object AssistantSessionAutoRunner {
             val categoryLower = event.category.lowercase(Locale.US)
             val summaryLower = event.summary.lowercase(Locale.US)
 
-            if (categoryLower == "audio" || sourceLower.contains("audio")) {
-                val stitched = payloadString(event.payload, "stitchedTranscript")
-                val transcript = payloadString(event.payload, "transcript")
-                val text = when {
-                    !stitched.isNullOrBlank() -> stitched
-                    !transcript.isNullOrBlank() -> transcript
-                    event.summary.startsWith("Ambient speech transcript:", ignoreCase = true) ->
-                        event.summary.substringAfter(":", "").trim()
-                    else -> null
-                }
-                if (!text.isNullOrBlank()) {
-                    speechSegments += text
-                }
-            }
+            extractSpeechSignal(event)?.let { speechSignals += it }
 
             if (categoryLower == "location" || sourceLower.contains("location")) {
                 if (latitude == null) latitude = payloadDouble(event.payload, "latitude")
@@ -212,14 +245,10 @@ object AssistantSessionAutoRunner {
             }
         }
 
-        val speechSummary = speechSegments
-            .asSequence()
-            .map { normalizeSnippet(it) }
-            .filter { it.isNotBlank() }
-            .distinct()
-            .take(2)
-            .joinToString(separator = " | ")
-            .ifBlank { "No speech transcript in this session" }
+        val speechSummary = buildSpeechSummaryFromSignals(
+            signals = speechSignals,
+            maxSegments = 6,
+        )
 
         val positionSummary = when {
             latitude != null && longitude != null -> {
@@ -255,6 +284,112 @@ object AssistantSessionAutoRunner {
         )
     }
 
+    private fun extractSpeechSignal(event: ContextEventPayload): SpeechSignal? {
+        val sourceLower = event.source.lowercase(Locale.US)
+        val categoryLower = event.category.lowercase(Locale.US)
+        if (categoryLower != "audio" && !sourceLower.contains("audio")) return null
+
+        val status = payloadString(event.payload, "status")?.lowercase(Locale.US).orEmpty()
+        if (status == "no_speech" || status == "error") return null
+
+        val stitched = payloadString(event.payload, "stitchedTranscript")
+        val transcript = payloadString(event.payload, "transcript")
+        val summaryTranscript = if (event.summary.startsWith("Ambient speech transcript", ignoreCase = true)) {
+            event.summary.substringAfter(":", "").trim()
+        } else {
+            ""
+        }
+        val pickedText = listOf(stitched, transcript, summaryTranscript)
+            .firstOrNull { !it.isNullOrBlank() }
+            .orEmpty()
+            .trim()
+        if (pickedText.isBlank() || isNonSpeechText(pickedText)) return null
+
+        val isCloudRefined = payloadBoolean(event.payload, "refinedByCloud") == true ||
+            payloadString(event.payload, "modelStatus")?.contains("cloud_refined", ignoreCase = true) == true ||
+            payloadString(event.payload, "strategy")?.contains("gpt-4o-transcribe", ignoreCase = true) == true ||
+            sourceLower.contains("refiner")
+
+        val clipKey = payloadString(event.payload, "wavPath")
+            ?.ifBlank { null }
+            ?: payloadString(event.payload, "clipOccurredAt")
+                ?.ifBlank { null }
+                ?.let { "clipAt:$it" }
+            ?: "${event.occurredAt}:${pickedText.take(72).lowercase(Locale.US)}"
+
+        return SpeechSignal(
+            occurredAt = event.occurredAt,
+            clipKey = clipKey,
+            text = pickedText,
+            priority = if (isCloudRefined) 2 else 1,
+        )
+    }
+
+    private fun buildSpeechSummaryFromSignals(
+        signals: List<SpeechSignal>,
+        maxSegments: Int,
+    ): String {
+        if (signals.isEmpty()) return "No speech transcript in this session"
+
+        val bestByClip = linkedMapOf<String, SpeechSignal>()
+        signals
+            .sortedWith(
+                compareByDescending<SpeechSignal> { it.occurredAt }
+                    .thenByDescending { it.priority }
+            )
+            .forEach { signal ->
+                val existing = bestByClip[signal.clipKey]
+                if (
+                    existing == null ||
+                    signal.priority > existing.priority ||
+                    (signal.priority == existing.priority && signal.occurredAt > existing.occurredAt)
+                ) {
+                    bestByClip[signal.clipKey] = signal
+                }
+            }
+
+        val normalized = bestByClip.values
+            .sortedWith(
+                compareByDescending<SpeechSignal> { it.occurredAt }
+                    .thenByDescending { it.priority }
+            )
+            .asSequence()
+            .map { normalizeSnippet(it.text) }
+            .filter { it.isNotBlank() }
+            .distinctBy { it.lowercase(Locale.US) }
+            .toList()
+
+        if (normalized.isEmpty()) return "No speech transcript in this session"
+
+        val shown = normalized.take(maxSegments)
+        val extra = normalized.size - shown.size
+        return if (extra > 0) {
+            "${shown.joinToString(separator = " | ")} | (+$extra more speech clips)"
+        } else {
+            shown.joinToString(separator = " | ")
+        }
+    }
+
+    private fun isNonSpeechText(raw: String): Boolean {
+        val lower = raw.trim().lowercase(Locale.US)
+        if (lower.isBlank()) return true
+        if (
+            lower == "<no-speech>" ||
+            lower == "no speech" ||
+            lower == "no_speech" ||
+            lower == "[silence]" ||
+            lower == "silence" ||
+            lower == "empty_or_no_speech"
+        ) {
+            return true
+        }
+        if (lower.startsWith("speech recognizer failed")) return true
+        if (lower.contains("speech_error_")) return true
+        if (lower.contains("no clear speech")) return true
+        if (lower.contains("未识别") || lower.contains("无法识别")) return true
+        return false
+    }
+
     private fun buildPrompt(
         startMs: Long,
         endMs: Long,
@@ -267,6 +402,12 @@ object AssistantSessionAutoRunner {
             The answer must be evidence-grounded, not generic.
             You must use at least two evidence signals from speech / calendar / motion / connectivity.
             If mood evidence is weak, state mood as uncertain.
+            Make action steps aggressive and immediately executable in the next 10 minutes.
+            Prefer direct outcomes (book/order/open/contact) over passive suggestions.
+            Only propose domains that are directly supported by session evidence.
+            Do NOT invent unrelated tools/apps/tasks (for example GitHub, calendar prep, Gmail, Slack) unless explicitly supported by speech/calendar/event evidence in this session.
+            If evidence is weak, output fewer steps (1-2) and keep them targeted to the strongest explicit user intent.
+            For each action step, include one concrete endpoint or query target and mention the evidence phrase briefly.
 
             Session window: ${formatSessionRange(startMs, endMs)}
             Event count: $eventCount
@@ -327,7 +468,7 @@ object AssistantSessionAutoRunner {
         val actionLines = if (planHeader >= 0) {
             lines.drop(planHeader + 1)
                 .mapNotNull { line ->
-                    val normalized = line.trimStart('-', '*').trim()
+                    val normalized = normalizeActionLine(line)
                     if (normalized.isBlank()) null else normalized
                 }
                 .take(3)
@@ -424,6 +565,11 @@ object AssistantSessionAutoRunner {
         }.take(220)
 
         val actions = mutableListOf<String>()
+        val milkTeaIntent = containsAny(speechLower, listOf("奶茶", "milk tea", "bubble tea", "boba", "茶饮"))
+        if (milkTeaIntent) {
+            actions += "Find top nearby milk tea shops by ETA and rating, then show direct order/search links."
+            actions += "Prepare a default order draft (size, sugar, ice) and ask one-tap confirmation."
+        }
         if (calendarSignals > 0) {
             actions += "Prepare a 3-point brief for the next meeting/task."
             actions += "Surface the most relevant notes/files before the meeting."
@@ -435,8 +581,8 @@ object AssistantSessionAutoRunner {
             actions += "Keep interventions short and defer deep tasks until stationary."
         }
         if (actions.isEmpty()) {
-            actions += "Keep passive monitoring and wait for stronger intent signals."
-            actions += "Avoid interrupting unless urgency increases."
+            actions += "Run one targeted search from current context and surface three executable links."
+            actions += "Ask one confirmation question, then execute the highest-confidence next step."
         }
 
         return HeuristicGuess(
@@ -472,6 +618,13 @@ object AssistantSessionAutoRunner {
 
     private fun containsAny(text: String, needles: List<String>): Boolean {
         return needles.any { text.contains(it, ignoreCase = true) }
+    }
+
+    private fun normalizeActionLine(line: String): String {
+        return line
+            .replace(Regex("^\\s*[-*•]+\\s*"), "")
+            .replace(Regex("^\\s*\\d+[\\).]\\s*"), "")
+            .trim()
     }
 
     private fun safePayloadMap(payloadJson: String): Map<String, Any> {

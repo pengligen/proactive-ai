@@ -20,6 +20,10 @@ class OrchestratorSyncWorker(
 ) : CoroutineWorker(appContext, params) {
 
     override suspend fun doWork(): Result {
+        if (AppPrefs.isGlobalLockEnabled(applicationContext)) {
+            return Result.success()
+        }
+
         val store = ContextEventStore.getInstance(applicationContext)
         store.pruneExpired()
 
@@ -37,7 +41,7 @@ class OrchestratorSyncWorker(
             },
         )
 
-        val gateway = HttpOrchestratorGateway()
+        val gateway = HttpOrchestratorGateway(appContext = applicationContext)
         val accepted = gateway.ingestEvents(payload).getOrElse { return Result.retry() }
         if (accepted <= 0) {
             return Result.retry()

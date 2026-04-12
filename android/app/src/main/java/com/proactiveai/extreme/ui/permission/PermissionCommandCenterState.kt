@@ -10,7 +10,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import com.proactiveai.extreme.app.AppPrefs
+import com.proactiveai.extreme.assistant.AssistantQuickAction
+import com.proactiveai.extreme.assistant.AssistantQuickActionPlanner
+import com.proactiveai.extreme.core.context.ContextEvent
 import com.proactiveai.extreme.core.context.IntentHint
+import com.proactiveai.extreme.core.context.Sensitivity
 import com.proactiveai.extreme.core.context.plugins.AudioAmbientPlugin
 import com.proactiveai.extreme.core.edge.EdgeInferenceResult
 import com.proactiveai.extreme.core.edge.EdgeModelProfile
@@ -29,7 +33,10 @@ import com.proactiveai.extreme.permission.PermissionStatusResolver
 import com.proactiveai.extreme.storage.ActionHistoryStore
 import com.proactiveai.extreme.storage.ActionQueueStore
 import com.proactiveai.extreme.storage.ContextEventStore
+import com.proactiveai.extreme.storage.StoredContextEvent
+import com.proactiveai.extreme.service.CloudSpeechTranscriptionRefiner
 import com.proactiveai.extreme.sync.ActionExecutionScheduler
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
@@ -38,6 +45,11 @@ import java.util.Locale
 
 private const val UI_STITCH_GAP_RESET_MS = 9_000L
 private const val UI_MAX_STITCH_CHARS = 1_400
+private const val MANUAL_INTAKE_TOTAL_TIMEOUT_MS = 120_000L
+private const val MANUAL_INTAKE_CLOUD_REFINE_TIMEOUT_MS = 45_000L
+private const val ASSISTANT_SESSION_WINDOW_MS = 15 * 60 * 1000L
+private const val ASSISTANT_SPEECH_MAX_CHARS = 12_000
+private const val ASSISTANT_NO_SPEECH_TEXT = "No speech transcript in this session"
 
 data class PermissionUiState(
     val id: String,
@@ -78,6 +90,7 @@ data class ActionHistoryUiState(
 data class ExecutionQueueUiState(
     val id: Long,
     val summary: String,
+    val detail: String?,
     val status: String,
     val attempts: String,
     val nextRetryLabel: String?,
@@ -124,8 +137,18 @@ data class AudioClipDebugUiState(
     val strategy: String,
     val transcript: String,
     val stitchedTranscript: String,
+    val refinedTranscript: String,
+    val refinedStatus: String,
     val reason: String,
     val modelStatus: String,
+)
+
+data class ManualSpeechIntakeResult(
+    val status: String,
+    val transcript: String,
+    val cloudRefined: Boolean,
+    val wavPath: String?,
+    val detail: String,
 )
 
 data class AssistantSessionRowUiState(
@@ -139,7 +162,21 @@ data class AssistantSessionRowUiState(
     val calendarSummary: String,
     val guessedUserScenario: String,
     val actionPlan: String,
+    val quickActions: List<AssistantQuickAction>,
     val modelLabel: String,
+)
+
+private data class AssistantSessionSortableRow(
+    val row: AssistantSessionRowUiState,
+    val sessionStartMs: Long,
+    val updatedAtMs: Long,
+)
+
+private data class SessionSpeechSignal(
+    val occurredAt: Long,
+    val clipKey: String,
+    val text: String,
+    val priority: Int,
 )
 
 private data class AudioClipRecord(
@@ -150,8 +187,33 @@ private data class AudioClipRecord(
     val strategy: String,
     val transcript: String,
     val stitchedTranscript: String,
+    val refinedTranscript: String,
+    val refinedStatus: String,
     val reason: String,
     val modelStatus: String,
+)
+
+private data class ManualSystemSnapshot(
+    val lightLux: Double?,
+    val ambientState: String,
+    val activityState: String,
+    val wifi: Boolean?,
+    val cellular: Boolean?,
+    val internet: Boolean?,
+    val bluetoothEnabled: Boolean?,
+    val wifiSsid: String?,
+    val locationLabel: String,
+    val latitude: Double?,
+    val longitude: Double?,
+    val motionState: String,
+)
+
+private data class ManualClipSnapshot(
+    val occurredAt: Long,
+    val durationMs: Long,
+    val clipRmsDb: Double,
+    val clipPeakDb: Double,
+    val metaPath: String?,
 )
 
 enum class ActionHistoryFilter(val label: String) {
@@ -212,6 +274,9 @@ class PermissionCommandCenterState internal constructor(
     var collectionEnabled by mutableStateOf(AppPrefs.isCollectionEnabled(appContext))
         private set
 
+    var globalLockEnabled by mutableStateOf(AppPrefs.isGlobalLockEnabled(appContext))
+        private set
+
     var orchestratorHealthLabel by mutableStateOf("Unknown")
         private set
 
@@ -252,6 +317,9 @@ class PermissionCommandCenterState internal constructor(
         private set
 
     var huggingFaceToken by mutableStateOf(AppPrefs.getHuggingFaceToken(appContext))
+        private set
+
+    var openAiApiKey by mutableStateOf(AppPrefs.getOpenAiApiKey(appContext))
         private set
 
     var latestInferenceSummary by mutableStateOf("No on-device inference yet")
@@ -350,6 +418,7 @@ class PermissionCommandCenterState internal constructor(
         val enabledPlugins = AppPrefs.getEnabledPlugins(appContext)
         masterEnabled = AppPrefs.isMasterEnabled(appContext)
         collectionEnabled = AppPrefs.isCollectionEnabled(appContext)
+        globalLockEnabled = AppPrefs.isGlobalLockEnabled(appContext)
         unsyncedEvents = ContextEventStore.getInstance(appContext).countUnsynced()
         autoExecuteLowRisk = AppPrefs.isAutoExecuteLowRisk(appContext)
         edgeModelId = AppPrefs.getEdgeModel(appContext)
@@ -362,6 +431,7 @@ class PermissionCommandCenterState internal constructor(
         localLlamaContextSize = AppPrefs.getLocalLlamaContextSize(appContext)
         localLlamaThreads = AppPrefs.getLocalLlamaThreads(appContext)
         huggingFaceToken = AppPrefs.getHuggingFaceToken(appContext)
+        openAiApiKey = AppPrefs.getOpenAiApiKey(appContext)
         refreshMetrics()
 
         _plugins.clear()
@@ -412,6 +482,18 @@ class PermissionCommandCenterState internal constructor(
         collectionEnabled = enabled
     }
 
+    fun persistGlobalLockEnabled(enabled: Boolean) {
+        AppPrefs.setGlobalLockEnabled(appContext, enabled)
+        globalLockEnabled = enabled
+        if (enabled) {
+            connectorStatusMessage = "Global lock enabled: connector and outbound calls are blocked."
+            queueStatusMessage = "Global lock enabled: queued execution paused."
+            lastPlanPreview = "Global lock ON: local/cloud inference and outbound actions are blocked."
+        } else {
+            lastPlanPreview = "Global lock OFF: inference and outbound actions resumed."
+        }
+    }
+
     fun setEdgeModel(modelId: String) {
         AppPrefs.setEdgeModel(appContext, modelId)
         edgeModelId = modelId
@@ -453,6 +535,11 @@ class PermissionCommandCenterState internal constructor(
     fun persistHuggingFaceToken(token: String) {
         AppPrefs.setHuggingFaceToken(appContext, token)
         huggingFaceToken = token
+    }
+
+    fun persistOpenAiApiKey(apiKey: String) {
+        AppPrefs.setOpenAiApiKey(appContext, apiKey)
+        openAiApiKey = apiKey
     }
 
     fun setInference(result: EdgeInferenceResult) {
@@ -619,6 +706,10 @@ class PermissionCommandCenterState internal constructor(
         connectorStatusMessage = text
     }
 
+    fun updateQueueStatusMessage(text: String) {
+        queueStatusMessage = text
+    }
+
     fun refreshActionHistory() {
         val filtered = historyStore.recent(limit = 200).filter { item ->
             when (historyFilter) {
@@ -678,13 +769,14 @@ class PermissionCommandCenterState internal constructor(
     }
 
     fun refreshQueue() {
-        val rows = queueStore.recent(limit = 40)
+        val rows = queueStore.recent(limit = 20)
         _executionQueue.clear()
         _executionQueue.addAll(
             rows.map { item ->
                 ExecutionQueueUiState(
                     id = item.id,
-                    summary = "${item.connector}.${item.operation} (${item.stepId.take(8)})",
+                    summary = formatQueueSummary(item.connector, item.operation, item.stepId, item.argsJson),
+                    detail = formatQueueDetail(item.connector, item.operation, item.argsJson),
                     status = item.status,
                     attempts = "${item.attemptCount}/${item.maxAttempts}",
                     nextRetryLabel = item.nextRetryAt.takeIf { it in 1 until Long.MAX_VALUE }?.let(::formatTime),
@@ -805,6 +897,8 @@ class PermissionCommandCenterState internal constructor(
             val strategy = meta["strategy"]?.toString().orEmpty().ifBlank { "unknown" }
             val transcript = meta["transcript"]?.toString().orEmpty()
             val stitchedTranscript = meta["stitchedTranscript"]?.toString().orEmpty()
+            val refinedTranscript = meta["openAiRefinedTranscript"]?.toString().orEmpty()
+            val refinedStatus = meta["openAiRefinedStatus"]?.toString().orEmpty()
             val reason = meta["reason"]?.toString().orEmpty()
             val modelStatus = meta["modelStatus"]?.toString().orEmpty()
 
@@ -816,6 +910,8 @@ class PermissionCommandCenterState internal constructor(
                 strategy = strategy,
                 transcript = transcript,
                 stitchedTranscript = stitchedTranscript,
+                refinedTranscript = refinedTranscript,
+                refinedStatus = refinedStatus,
                 reason = reason,
                 modelStatus = modelStatus,
             )
@@ -842,6 +938,8 @@ class PermissionCommandCenterState internal constructor(
                     strategy = record.strategy,
                     transcript = record.transcript,
                     stitchedTranscript = finalStitched,
+                    refinedTranscript = record.refinedTranscript,
+                    refinedStatus = record.refinedStatus,
                     reason = record.reason,
                     modelStatus = record.modelStatus,
                 )
@@ -920,6 +1018,297 @@ class PermissionCommandCenterState internal constructor(
         }
     }
 
+    suspend fun runCloudTranscribeSingleAudioClip(path: String) {
+        val outcome = CloudSpeechTranscriptionRefiner.transcribeSingleClip(
+            context = appContext,
+            wavPath = path,
+        )
+        refreshAudioClips()
+        refreshContextTimeline()
+        refreshAssistantSessions()
+        audioClipStatusMessage = buildString {
+            append("GPT transcribe result: status=${outcome.status}")
+            if (outcome.transcript.isNotBlank()) {
+                append(", transcript=\"${outcome.transcript.take(120)}\"")
+            }
+            if (outcome.detail.isNotBlank()) {
+                append(", detail=${outcome.detail}")
+            }
+        }
+    }
+
+    suspend fun captureManualSpeechIntakeContext(
+        shouldStop: (() -> Boolean)? = null,
+    ): ManualSpeechIntakeResult {
+        if (AppPrefs.isGlobalLockEnabled(appContext)) {
+            return ManualSpeechIntakeResult(
+                status = "blocked",
+                transcript = "",
+                cloudRefined = false,
+                wavPath = null,
+                detail = "Global lock enabled: manual speech intake blocked.",
+            )
+        }
+
+        val plugin = audioReplayPlugin
+        if (plugin == null) {
+            return ManualSpeechIntakeResult(
+                status = "error",
+                transcript = "",
+                cloudRefined = false,
+                wavPath = null,
+                detail = "Manual intake unavailable: audio_ambient descriptor missing.",
+            )
+        }
+
+        val manualHoldMode = shouldStop != null
+        val intake = withTimeoutOrNull(MANUAL_INTAKE_TOTAL_TIMEOUT_MS) {
+            plugin.captureManualIntakeOnce(
+                shouldStop = shouldStop,
+                deferCloudTranscription = manualHoldMode,
+            )
+        } ?: return ManualSpeechIntakeResult(
+            status = "timeout",
+            transcript = "",
+            cloudRefined = false,
+            wavPath = null,
+            detail = "Manual intake timed out after ${MANUAL_INTAKE_TOTAL_TIMEOUT_MS / 1000}s. Please try again.",
+        )
+        val wavPath = intake.wavPath
+
+        if (manualHoldMode && intake.status == "captured_untranscribed" && !wavPath.isNullOrBlank()) {
+            val clip = readManualClipSnapshot(wavPath)
+            return ManualSpeechIntakeResult(
+                status = "captured",
+                transcript = "",
+                cloudRefined = false,
+                wavPath = wavPath,
+                detail = buildString {
+                    append("WAV captured (${clip.durationMs}ms). ")
+                    append("Ready for async cloud transcription.")
+                },
+            )
+        }
+
+        if (intake.status != "recognized") {
+            return ManualSpeechIntakeResult(
+                status = intake.status,
+                transcript = intake.transcript.orEmpty(),
+                cloudRefined = false,
+                wavPath = wavPath,
+                detail = buildString {
+                    append("Manual intake status=${intake.status}, strategy=${intake.strategy}")
+                    if (!intake.reason.isNullOrBlank()) append(", reason=${intake.reason}")
+                    if (intake.modelStatus.isNotBlank()) append(", detail=${intake.modelStatus}")
+                },
+            )
+        }
+
+        val intakeAlreadyCloud = intake.strategy.contains("gpt-4o-transcribe", ignoreCase = true) ||
+            intake.strategy.contains("cloud", ignoreCase = true)
+        var finalTranscript = intake.transcript.orEmpty().trim()
+        var cloudRefined = false
+        var cloudDetail = ""
+        if (!wavPath.isNullOrBlank() && !manualHoldMode && !intakeAlreadyCloud) {
+            val cloud = withTimeoutOrNull(MANUAL_INTAKE_CLOUD_REFINE_TIMEOUT_MS) {
+                CloudSpeechTranscriptionRefiner.transcribeSingleClip(
+                    context = appContext,
+                    wavPath = wavPath,
+                )
+            }
+            if (cloud == null) {
+                cloudDetail = "cloud_refine_timeout_${MANUAL_INTAKE_CLOUD_REFINE_TIMEOUT_MS / 1000}s"
+            } else {
+                cloudDetail = cloud.detail
+                if (cloud.status == "recognized" && cloud.transcript.isNotBlank()) {
+                    finalTranscript = cloud.transcript.trim()
+                    cloudRefined = true
+                }
+            }
+        } else if (manualHoldMode || intakeAlreadyCloud) {
+            cloudDetail = "cloud_refine_not_needed_or_already_applied"
+        }
+
+        if (finalTranscript.isBlank() || isNoSpeechText(finalTranscript)) {
+            return ManualSpeechIntakeResult(
+                status = "no_speech",
+                transcript = "",
+                cloudRefined = cloudRefined,
+                wavPath = wavPath,
+                detail = "Manual intake detected no clear speech.${if (cloudDetail.isNotBlank()) " $cloudDetail" else ""}",
+            )
+        }
+
+        val snapshot = buildManualSystemSnapshot()
+        val transcriptionEventAt = System.currentTimeMillis()
+        val clipSnapshot = readManualClipSnapshot(wavPath.orEmpty())
+        val stitched = finalTranscript.take(UI_MAX_STITCH_CHARS)
+        val locationLabel = snapshot.locationLabel
+        val indoorOutdoor = inferIndoorOutdoor(
+            wifi = snapshot.wifi,
+            cellular = snapshot.cellular,
+        )
+        val strategy = if (cloudRefined) "manual_intake_gpt4o_transcribe" else intake.strategy
+        val modelStatus = if (cloudRefined) "cloud_refined" else intake.modelStatus
+
+        ContextEventStore.getInstance(appContext).insert(
+            ContextEvent(
+                eventId = java.util.UUID.randomUUID().toString(),
+                occurredAt = clipSnapshot.occurredAt,
+                source = "assistant_manual_audio_intake",
+                category = "audio",
+                summary = "Manual intake speech: $stitched",
+                payload = buildMap<String, Any> {
+                    put("status", "recognized")
+                    put("manualIntake", true)
+                    put("transcript", finalTranscript)
+                    put("stitchedTranscript", stitched)
+                    put("strategy", strategy)
+                    put("modelStatus", modelStatus)
+                    put("refinedByCloud", cloudRefined)
+                    put("wavPath", wavPath.orEmpty())
+                    put("metaPath", clipSnapshot.metaPath.orEmpty().ifBlank { intake.metaPath.orEmpty() })
+                    put("durationMs", if (clipSnapshot.durationMs > 0L) clipSnapshot.durationMs else (intake.durationMs ?: -1L))
+                    put("clipRmsDb", clipSnapshot.clipRmsDb.takeIf { it > -120.0 } ?: (intake.clipRmsDb?.toDouble() ?: -120.0))
+                    put("clipPeakDb", clipSnapshot.clipPeakDb.takeIf { it > -120.0 } ?: (intake.clipPeakDb?.toDouble() ?: -120.0))
+                    put("clipOccurredAt", clipSnapshot.occurredAt)
+                    put("transcriptionEventAt", transcriptionEventAt)
+                    put("lightLux", snapshot.lightLux ?: -1.0)
+                    put("ambientState", snapshot.ambientState)
+                    put("activityState", snapshot.activityState)
+                    if (snapshot.wifi != null) put("wifi", snapshot.wifi)
+                    if (snapshot.cellular != null) put("cellular", snapshot.cellular)
+                    if (snapshot.internet != null) put("internet", snapshot.internet)
+                    if (snapshot.bluetoothEnabled != null) put("bluetoothEnabled", snapshot.bluetoothEnabled)
+                    if (!snapshot.wifiSsid.isNullOrBlank()) put("wifiSsid", snapshot.wifiSsid)
+                    put("indoorOutdoor", indoorOutdoor)
+                    put("locationLabel", locationLabel)
+                    if (snapshot.latitude != null) put("latitude", snapshot.latitude)
+                    if (snapshot.longitude != null) put("longitude", snapshot.longitude)
+                    put("motionState", snapshot.motionState)
+                },
+                sensitivity = Sensitivity.HIGH,
+                ttlSeconds = 7 * 24 * 3600,
+            )
+        )
+
+        return ManualSpeechIntakeResult(
+            status = "recognized",
+            transcript = finalTranscript,
+            cloudRefined = cloudRefined,
+            wavPath = wavPath,
+            detail = buildString {
+                append("Manual intake inserted with system snapshot | strategy=$strategy")
+                append(", indoor=$indoorOutdoor")
+                append(", location=$locationLabel")
+                if (cloudDetail.isNotBlank()) append(", cloud=$cloudDetail")
+            },
+        )
+    }
+
+    suspend fun transcribeManualSpeechIntakeContextFromWav(wavPath: String): ManualSpeechIntakeResult {
+        if (AppPrefs.isGlobalLockEnabled(appContext)) {
+            return ManualSpeechIntakeResult(
+                status = "blocked",
+                transcript = "",
+                cloudRefined = false,
+                wavPath = wavPath,
+                detail = "Global lock enabled: manual speech cloud transcription blocked.",
+            )
+        }
+
+        val clip = readManualClipSnapshot(wavPath)
+        val cloud = withTimeoutOrNull(MANUAL_INTAKE_CLOUD_REFINE_TIMEOUT_MS) {
+            CloudSpeechTranscriptionRefiner.transcribeSingleClip(
+                context = appContext,
+                wavPath = wavPath,
+                manualTrigger = true,
+            )
+        } ?: return ManualSpeechIntakeResult(
+            status = "timeout",
+            transcript = "",
+            cloudRefined = false,
+            wavPath = wavPath,
+            detail = "Cloud transcription timeout after ${MANUAL_INTAKE_CLOUD_REFINE_TIMEOUT_MS / 1000}s.",
+        )
+
+        val transcript = cloud.transcript.trim()
+        if (cloud.status != "recognized" || transcript.isBlank() || isNoSpeechText(transcript)) {
+            return ManualSpeechIntakeResult(
+                status = if (cloud.status == "recognized") "no_speech" else cloud.status,
+                transcript = "",
+                cloudRefined = false,
+                wavPath = wavPath,
+                detail = buildString {
+                    append("Manual intake cloud transcription ${cloud.status}")
+                    if (cloud.detail.isNotBlank()) append(": ${cloud.detail}")
+                },
+            )
+        }
+
+        val snapshot = buildManualSystemSnapshot()
+        val stitched = transcript.take(UI_MAX_STITCH_CHARS)
+        val locationLabel = snapshot.locationLabel
+        val indoorOutdoor = inferIndoorOutdoor(
+            wifi = snapshot.wifi,
+            cellular = snapshot.cellular,
+        )
+        val transcriptionEventAt = System.currentTimeMillis()
+
+        ContextEventStore.getInstance(appContext).insert(
+            ContextEvent(
+                eventId = java.util.UUID.randomUUID().toString(),
+                occurredAt = clip.occurredAt,
+                source = "assistant_manual_audio_intake",
+                category = "audio",
+                summary = "Manual intake speech: $stitched",
+                payload = buildMap<String, Any> {
+                    put("status", "recognized")
+                    put("manualIntake", true)
+                    put("transcript", transcript)
+                    put("stitchedTranscript", stitched)
+                    put("strategy", "manual_intake_gpt4o_transcribe")
+                    put("modelStatus", "cloud_refined")
+                    put("refinedByCloud", true)
+                    put("wavPath", wavPath)
+                    put("metaPath", clip.metaPath.orEmpty())
+                    put("durationMs", clip.durationMs)
+                    put("clipRmsDb", clip.clipRmsDb)
+                    put("clipPeakDb", clip.clipPeakDb)
+                    put("clipOccurredAt", clip.occurredAt)
+                    put("transcriptionEventAt", transcriptionEventAt)
+                    put("lightLux", snapshot.lightLux ?: -1.0)
+                    put("ambientState", snapshot.ambientState)
+                    put("activityState", snapshot.activityState)
+                    if (snapshot.wifi != null) put("wifi", snapshot.wifi)
+                    if (snapshot.cellular != null) put("cellular", snapshot.cellular)
+                    if (snapshot.internet != null) put("internet", snapshot.internet)
+                    if (snapshot.bluetoothEnabled != null) put("bluetoothEnabled", snapshot.bluetoothEnabled)
+                    if (!snapshot.wifiSsid.isNullOrBlank()) put("wifiSsid", snapshot.wifiSsid)
+                    put("indoorOutdoor", indoorOutdoor)
+                    put("locationLabel", locationLabel)
+                    if (snapshot.latitude != null) put("latitude", snapshot.latitude)
+                    if (snapshot.longitude != null) put("longitude", snapshot.longitude)
+                    put("motionState", snapshot.motionState)
+                },
+                sensitivity = Sensitivity.HIGH,
+                ttlSeconds = 7 * 24 * 3600,
+            )
+        )
+
+        return ManualSpeechIntakeResult(
+            status = "recognized",
+            transcript = transcript,
+            cloudRefined = true,
+            wavPath = wavPath,
+            detail = buildString {
+                append("Manual intake transcribed and inserted | strategy=manual_intake_gpt4o_transcribe")
+                append(", indoor=$indoorOutdoor")
+                append(", location=$locationLabel")
+            },
+        )
+    }
+
     fun updateContextInsight(summary: String, actions: List<String>, eventCount: Int, status: String) {
         contextInsightSummary = summary
         _contextInsightActions.clear()
@@ -945,8 +1334,14 @@ class PermissionCommandCenterState internal constructor(
     }
 
     fun refreshAssistantSessions(limit: Int = 24) {
-        val rows = ContextEventStore.getInstance(appContext)
-            .getRecent(limit = 1500)
+        val store = ContextEventStore.getInstance(appContext)
+        val recentRows = store.getRecent(limit = 2200)
+        val sessionSpeechByStart = buildAssistantSessionSpeechMap(
+            recentRows = recentRows,
+            maxSegments = Int.MAX_VALUE,
+        )
+
+        val rows = recentRows
             .filter { it.category == "assistant_session" }
             .mapNotNull { row ->
                 val payload = kotlin.runCatching { JSONObject(row.payloadJson).toMap() }.getOrNull().orEmpty()
@@ -955,24 +1350,58 @@ class PermissionCommandCenterState internal constructor(
                 }
                 val sessionLabel = payload["sessionLabel"]?.toString().orEmpty()
                 if (sessionLabel.isBlank()) return@mapNotNull null
+                val sessionStartMs = payload["sessionStartMs"]?.toString()?.toLongOrNull()
+                    ?: sessionId.removePrefix("session_").toLongOrNull()
+                    ?: 0L
+                val persistedSpeech = payload["speechFull"]?.toString().orEmpty()
+                    .ifBlank { payload["speechSummary"]?.toString().orEmpty() }
+                val rebuiltSpeech = sessionSpeechByStart[sessionStartMs].orEmpty()
+                val speechSummary = when {
+                    rebuiltSpeech.isNotBlank() && !isNoSpeechText(rebuiltSpeech) -> rebuiltSpeech
+                    persistedSpeech.isNotBlank() -> persistedSpeech
+                    else -> ASSISTANT_NO_SPEECH_TEXT
+                }
+                val positionSummary = payload["positionSummary"]?.toString().orEmpty()
+                val indoorOutdoor = payload["indoorOutdoor"]?.toString().orEmpty()
+                val locationLabel = payload["locationLabel"]?.toString().orEmpty()
+                val calendarSummary = payload["calendarSummary"]?.toString().orEmpty()
+                val guessedUserScenario = payload["guessedUserScenario"]?.toString()
+                    .orEmpty()
+                    .ifBlank { payload["suggestion"]?.toString().orEmpty() }
+                val actionPlan = payload["actionPlan"]?.toString().orEmpty()
+                val quickActions = AssistantQuickActionPlanner.inferQuickActions(
+                    speechSummary = speechSummary,
+                    guessedUserScenario = guessedUserScenario,
+                    actionPlan = actionPlan,
+                    locationLabel = locationLabel,
+                    calendarSummary = calendarSummary,
+                )
 
-                AssistantSessionRowUiState(
-                    sessionId = sessionId,
-                    sessionLabel = sessionLabel,
-                    eventCount = payload["eventCount"].toString().toIntOrNull() ?: 0,
-                    speechSummary = payload["speechSummary"]?.toString().orEmpty(),
-                    positionSummary = payload["positionSummary"]?.toString().orEmpty(),
-                    indoorOutdoor = payload["indoorOutdoor"]?.toString().orEmpty(),
-                    locationLabel = payload["locationLabel"]?.toString().orEmpty(),
-                    calendarSummary = payload["calendarSummary"]?.toString().orEmpty(),
-                    guessedUserScenario = payload["guessedUserScenario"]?.toString()
-                        .orEmpty()
-                        .ifBlank { payload["suggestion"]?.toString().orEmpty() },
-                    actionPlan = payload["actionPlan"]?.toString().orEmpty(),
-                    modelLabel = payload["modelLabel"]?.toString().orEmpty(),
+                AssistantSessionSortableRow(
+                    row = AssistantSessionRowUiState(
+                        sessionId = sessionId,
+                        sessionLabel = sessionLabel,
+                        eventCount = payload["eventCount"].toString().toIntOrNull() ?: 0,
+                        speechSummary = speechSummary,
+                        positionSummary = positionSummary,
+                        indoorOutdoor = indoorOutdoor,
+                        locationLabel = locationLabel,
+                        calendarSummary = calendarSummary,
+                        guessedUserScenario = guessedUserScenario,
+                        actionPlan = actionPlan,
+                        quickActions = quickActions,
+                        modelLabel = payload["modelLabel"]?.toString().orEmpty(),
+                    ),
+                    sessionStartMs = sessionStartMs,
+                    updatedAtMs = row.occurredAt,
                 )
             }
-            .distinctBy { it.sessionId }
+            .distinctBy { it.row.sessionId }
+            .sortedWith(
+                compareByDescending<AssistantSessionSortableRow> { it.sessionStartMs }
+                    .thenByDescending { it.updatedAtMs }
+            )
+            .map { it.row }
             .take(limit)
 
         _assistantSessionRows.clear()
@@ -982,6 +1411,129 @@ class PermissionCommandCenterState internal constructor(
         } else {
             "Showing latest ${rows.size} 15-minute assistant sessions"
         }
+    }
+
+    private fun buildAssistantSessionSpeechMap(
+        recentRows: List<StoredContextEvent>,
+        maxSegments: Int,
+    ): Map<Long, String> {
+        val grouped = linkedMapOf<Long, MutableList<SessionSpeechSignal>>()
+        recentRows.forEach { row ->
+            val payload = safePayloadMap(row.payloadJson)
+            val signal = extractAssistantSessionSpeechSignal(
+                row = row,
+                payload = payload,
+            ) ?: return@forEach
+            val sessionStart = (row.occurredAt / ASSISTANT_SESSION_WINDOW_MS) * ASSISTANT_SESSION_WINDOW_MS
+            grouped.getOrPut(sessionStart) { mutableListOf() }.add(signal)
+        }
+
+        return grouped.mapValues { (_, signals) ->
+            buildSpeechSummaryFromSessionSignals(
+                signals = signals,
+                maxSegments = maxSegments,
+            )
+        }
+    }
+
+    private fun extractAssistantSessionSpeechSignal(
+        row: StoredContextEvent,
+        payload: Map<String, Any?>,
+    ): SessionSpeechSignal? {
+        val sourceLower = row.source.lowercase(Locale.US)
+        val categoryLower = row.category.lowercase(Locale.US)
+        if (categoryLower != "audio" && !sourceLower.contains("audio")) return null
+
+        val status = valueAsString(payload["status"])?.lowercase(Locale.US).orEmpty()
+        if (status == "no_speech" || status == "error") return null
+
+        val stitched = valueAsString(payload["stitchedTranscript"])
+        val transcript = valueAsString(payload["transcript"])
+        val summaryTranscript = when {
+            row.summary.startsWith("Ambient speech transcript", ignoreCase = true) ->
+                row.summary.substringAfter(":", "").trim()
+            row.summary.startsWith("Manual intake speech", ignoreCase = true) ->
+                row.summary.substringAfter(":", "").trim()
+            else -> ""
+        }
+        val pickedText = listOf(stitched, transcript, summaryTranscript)
+            .firstOrNull { !it.isNullOrBlank() }
+            .orEmpty()
+            .trim()
+        if (pickedText.isBlank() || isNoSpeechText(pickedText)) return null
+
+        val isCloudRefined = valueAsBoolean(payload["refinedByCloud"]) == true ||
+            valueAsString(payload["modelStatus"])?.contains("cloud_refined", ignoreCase = true) == true ||
+            valueAsString(payload["strategy"])?.contains("gpt-4o-transcribe", ignoreCase = true) == true ||
+            sourceLower.contains("refiner")
+
+        val clipKey = valueAsString(payload["wavPath"])
+            ?: valueAsString(payload["clipOccurredAt"])?.let { "clipAt:$it" }
+            ?: "${row.occurredAt}:${pickedText.take(72).lowercase(Locale.US)}"
+
+        return SessionSpeechSignal(
+            occurredAt = row.occurredAt,
+            clipKey = clipKey,
+            text = pickedText,
+            priority = if (isCloudRefined) 2 else 1,
+        )
+    }
+
+    private fun buildSpeechSummaryFromSessionSignals(
+        signals: List<SessionSpeechSignal>,
+        maxSegments: Int,
+    ): String {
+        if (signals.isEmpty()) return ASSISTANT_NO_SPEECH_TEXT
+
+        val bestByClip = linkedMapOf<String, SessionSpeechSignal>()
+        signals
+            .sortedWith(
+                compareByDescending<SessionSpeechSignal> { it.occurredAt }
+                    .thenByDescending { it.priority }
+            )
+            .forEach { signal ->
+                val existing = bestByClip[signal.clipKey]
+                if (
+                    existing == null ||
+                    signal.priority > existing.priority ||
+                    (signal.priority == existing.priority && signal.occurredAt > existing.occurredAt)
+                ) {
+                    bestByClip[signal.clipKey] = signal
+                }
+            }
+
+        val normalized = bestByClip.values
+            .sortedWith(
+                compareByDescending<SessionSpeechSignal> { it.occurredAt }
+                    .thenByDescending { it.priority }
+            )
+            .asSequence()
+            .map { normalizeSpeechSnippet(it.text) }
+            .filter { it.isNotBlank() }
+            .distinctBy { it.lowercase(Locale.US) }
+            .toList()
+
+        if (normalized.isEmpty()) return ASSISTANT_NO_SPEECH_TEXT
+
+        val effectiveLimit = when {
+            maxSegments <= 0 -> normalized.size
+            else -> minOf(maxSegments, normalized.size)
+        }
+        val shown = normalized.take(effectiveLimit)
+        val extra = normalized.size - shown.size
+        val composed = if (extra > 0) {
+            "${shown.joinToString(separator = " | ")} | (+$extra more speech clips)"
+        } else {
+            shown.joinToString(separator = " | ")
+        }
+        return composed.take(ASSISTANT_SPEECH_MAX_CHARS)
+    }
+
+    private fun normalizeSpeechSnippet(raw: String): String {
+        return raw
+            .trim()
+            .replace("\u0000", "")
+            .replace(Regex("\\s+"), " ")
     }
 
     fun enqueueAction(planId: String, step: ActionStepPayload): Long {
@@ -1022,6 +1574,10 @@ class PermissionCommandCenterState internal constructor(
     }
 
     fun triggerQueueExecutionNow() {
+        if (AppPrefs.isGlobalLockEnabled(appContext)) {
+            queueStatusMessage = "Global lock enabled: queue execution blocked."
+            return
+        }
         ActionExecutionScheduler.enqueueImmediate(appContext)
         refreshQueue()
         queueStatusMessage = "Queue run requested"
@@ -1042,6 +1598,54 @@ class PermissionCommandCenterState internal constructor(
             detail = detail,
         )
         refreshActionHistory()
+    }
+
+    private fun formatQueueSummary(
+        connector: String,
+        operation: String,
+        stepId: String,
+        argsJson: String,
+    ): String {
+        if (connector.equals("focus", ignoreCase = true) && operation.equals("today_top3", ignoreCase = true)) {
+            val args = kotlin.runCatching { JSONObject(argsJson) }.getOrNull()
+            val rank = args?.optInt("rank", -1)?.takeIf { it > 0 } ?: 0
+            val title = args?.optString("title").orEmpty().trim()
+            val importance = args?.optInt("importance", -1) ?: -1
+            val urgency = args?.optInt("urgency", -1) ?: -1
+            val missRisk = args?.optInt("missRisk", -1) ?: -1
+            val scoreLabel = if (importance >= 0 && urgency >= 0 && missRisk >= 0) {
+                " | I/U/M ${importance}/${urgency}/${missRisk}"
+            } else {
+                ""
+            }
+            val prefix = if (rank > 0) "Focus #$rank" else "Focus"
+            return if (title.isNotBlank()) {
+                "$prefix: $title$scoreLabel"
+            } else {
+                "$prefix item$scoreLabel"
+            }
+        }
+        return "${connector}.${operation} (${stepId.take(8)})"
+    }
+
+    private fun formatQueueDetail(
+        connector: String,
+        operation: String,
+        argsJson: String,
+    ): String? {
+        if (!connector.equals("focus", ignoreCase = true) || !operation.equals("today_top3", ignoreCase = true)) {
+            return null
+        }
+        val args = kotlin.runCatching { JSONObject(argsJson) }.getOrNull() ?: return null
+        val evidence = args.optString("evidence").trim()
+        val reason = args.optString("reason").trim()
+        val action = args.optString("action").trim()
+        val lines = buildList {
+            if (evidence.isNotBlank()) add("Evidence: $evidence")
+            if (reason.isNotBlank()) add("Why: $reason")
+            if (action.isNotBlank()) add("Next: $action")
+        }
+        return lines.joinToString("\n").take(520).ifBlank { null }
     }
 
     private fun connectorTitle(id: String): String {
@@ -1149,6 +1753,192 @@ class PermissionCommandCenterState internal constructor(
         } else {
             String.format(Locale.US, "%.2f MB", kb / 1024.0)
         }
+    }
+
+    private fun buildManualSystemSnapshot(): ManualSystemSnapshot {
+        val rows = ContextEventStore.getInstance(appContext).getRecent(320)
+
+        var lightLux: Double? = null
+        var ambientState = "unknown"
+        var activityState = "unknown"
+        var wifi: Boolean? = null
+        var cellular: Boolean? = null
+        var internet: Boolean? = null
+        var bluetoothEnabled: Boolean? = null
+        var wifiSsid: String? = null
+        var locationLabel = "Unknown location"
+        var latitude: Double? = null
+        var longitude: Double? = null
+        var motionState = "unknown"
+
+        rows.forEach { row ->
+            val category = row.category.lowercase(Locale.US)
+            val payload = safePayloadMap(row.payloadJson)
+
+            when (category) {
+                "sensor" -> {
+                    if (lightLux == null) lightLux = valueAsDouble(payload["lightLux"])
+                    if (ambientState == "unknown") {
+                        ambientState = valueAsString(payload["ambientState"]).orEmpty().ifBlank { ambientState }
+                    }
+                    if (activityState == "unknown") {
+                        activityState = valueAsString(payload["activityState"]).orEmpty().ifBlank { activityState }
+                    }
+                }
+
+                "connectivity" -> {
+                    if (wifi == null) wifi = valueAsBoolean(payload["wifi"])
+                    if (cellular == null) cellular = valueAsBoolean(payload["cellular"])
+                    if (internet == null) internet = valueAsBoolean(payload["internet"])
+                    if (bluetoothEnabled == null) bluetoothEnabled = valueAsBoolean(payload["bluetoothEnabled"])
+                    if (wifiSsid.isNullOrBlank()) wifiSsid = valueAsString(payload["wifiSsid"])
+                }
+
+                "location" -> {
+                    if (latitude == null) latitude = valueAsDouble(payload["latitude"])
+                    if (longitude == null) longitude = valueAsDouble(payload["longitude"])
+                    if (motionState == "unknown") {
+                        motionState = valueAsString(payload["motionState"]).orEmpty().ifBlank { motionState }
+                    }
+
+                    if (locationLabel.startsWith("Unknown", ignoreCase = true)) {
+                        val city = valueAsString(payload["city"]).orEmpty()
+                        locationLabel = when {
+                            city.isNotBlank() -> city
+                            latitude != null && longitude != null ->
+                                "GPS ${"%.4f".format(Locale.US, latitude)}, ${"%.4f".format(Locale.US, longitude)}"
+                            else -> row.summary.take(120)
+                        }
+                    }
+                }
+            }
+        }
+
+        if (locationLabel.startsWith("Unknown", ignoreCase = true) && latitude != null && longitude != null) {
+            locationLabel = "GPS ${"%.4f".format(Locale.US, latitude)}, ${"%.4f".format(Locale.US, longitude)}"
+        }
+
+        return ManualSystemSnapshot(
+            lightLux = lightLux,
+            ambientState = ambientState,
+            activityState = activityState,
+            wifi = wifi,
+            cellular = cellular,
+            internet = internet,
+            bluetoothEnabled = bluetoothEnabled,
+            wifiSsid = wifiSsid,
+            locationLabel = locationLabel,
+            latitude = latitude,
+            longitude = longitude,
+            motionState = motionState,
+        )
+    }
+
+    private fun readManualClipSnapshot(wavPath: String): ManualClipSnapshot {
+        if (wavPath.isBlank()) {
+            val now = System.currentTimeMillis()
+            return ManualClipSnapshot(
+                occurredAt = now,
+                durationMs = -1L,
+                clipRmsDb = -120.0,
+                clipPeakDb = -120.0,
+                metaPath = null,
+            )
+        }
+
+        val wavFile = File(wavPath)
+        val metaFile = wavFile.parentFile?.let { File(it, "${wavFile.nameWithoutExtension}.json") }
+        val meta = if (metaFile != null && metaFile.exists()) {
+            kotlin.runCatching { JSONObject(metaFile.readText()).toMap() }.getOrDefault(emptyMap())
+        } else {
+            emptyMap()
+        }
+
+        val occurredAt = valueAsLong(meta["createdAt"])
+            ?: wavFile.lastModified().takeIf { it > 0L }
+            ?: System.currentTimeMillis()
+        val durationMs = valueAsLong(meta["durationMs"]) ?: estimateWavDurationMs(wavFile.length())
+        val clipRmsDb = valueAsDouble(meta["clipRmsDb"]) ?: -120.0
+        val clipPeakDb = valueAsDouble(meta["clipPeakDb"]) ?: -120.0
+
+        return ManualClipSnapshot(
+            occurredAt = occurredAt,
+            durationMs = durationMs,
+            clipRmsDb = clipRmsDb,
+            clipPeakDb = clipPeakDb,
+            metaPath = metaFile?.absolutePath,
+        )
+    }
+
+    private fun safePayloadMap(payloadJson: String): Map<String, Any?> {
+        return kotlin.runCatching { JSONObject(payloadJson).toMap() }.getOrDefault(emptyMap())
+    }
+
+    private fun valueAsString(value: Any?): String? {
+        return when (value) {
+            null -> null
+            is String -> value.trim()
+            is Number -> value.toString()
+            is Boolean -> value.toString()
+            else -> null
+        }?.takeIf { it.isNotBlank() }
+    }
+
+    private fun valueAsDouble(value: Any?): Double? {
+        return when (value) {
+            is Number -> value.toDouble()
+            is String -> value.toDoubleOrNull()
+            else -> null
+        }
+    }
+
+    private fun valueAsLong(value: Any?): Long? {
+        return when (value) {
+            is Number -> value.toLong()
+            is String -> value.toLongOrNull()
+            else -> null
+        }
+    }
+
+    private fun valueAsBoolean(value: Any?): Boolean? {
+        return when (value) {
+            is Boolean -> value
+            is Number -> value.toInt() != 0
+            is String -> {
+                when (value.trim().lowercase(Locale.US)) {
+                    "1", "true", "yes", "on" -> true
+                    "0", "false", "no", "off" -> false
+                    else -> null
+                }
+            }
+            else -> null
+        }
+    }
+
+    private fun inferIndoorOutdoor(
+        wifi: Boolean?,
+        cellular: Boolean?,
+    ): String {
+        return when {
+            wifi == true && cellular != true -> "Indoor likely (wifi)"
+            cellular == true && wifi != true -> "Outdoor likely (cellular)"
+            wifi == true && cellular == true -> "Transition or mixed"
+            else -> "Unknown"
+        }
+    }
+
+    private fun isNoSpeechText(raw: String): Boolean {
+        val lower = raw.trim().lowercase(Locale.US)
+        if (lower.isBlank()) return true
+        return lower == "<no-speech>" ||
+            lower == "no speech" ||
+            lower == "no_speech" ||
+            lower == "[silence]" ||
+            lower == "silence" ||
+            lower.contains("no clear speech") ||
+            lower.contains("speech_error_") ||
+            lower.contains("未识别") ||
+            lower.contains("无法识别")
     }
 
     private fun formatTime(epochMs: Long): String {

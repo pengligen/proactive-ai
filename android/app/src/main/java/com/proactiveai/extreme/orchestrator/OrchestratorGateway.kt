@@ -1,5 +1,7 @@
 package com.proactiveai.extreme.orchestrator
 
+import android.content.Context
+import com.proactiveai.extreme.app.AppPrefs
 import com.proactiveai.extreme.core.model.RiskLevel
 import org.json.JSONArray
 import org.json.JSONObject
@@ -21,9 +23,13 @@ interface OrchestratorGateway {
 
 class HttpOrchestratorGateway(
     private val baseUrl: String = OrchestratorConfig.baseUrl(),
+    private val appContext: Context? = null,
 ) : OrchestratorGateway {
 
+    private val lockBlockMessage = "Global lock enabled: outbound cloud/orchestrator calls are blocked."
+
     override fun health(): Result<Boolean> {
+        if (isGlobalLockEnabled()) return lockFailure()
         return runCatching {
             val (code, body) = call("GET", "$baseUrl/health", null)
             code in 200..299 && JSONObject(body).optString("status") == "ok"
@@ -31,6 +37,7 @@ class HttpOrchestratorGateway(
     }
 
     override fun ingestEvents(payload: EventBatchPayload): Result<Int> {
+        if (isGlobalLockEnabled()) return lockFailure()
         return runCatching {
             val body = JSONObject().apply {
                 put("userId", payload.userId)
@@ -62,6 +69,7 @@ class HttpOrchestratorGateway(
     }
 
     override fun requestPlan(request: PlanRequestPayload): Result<ActionPlanPayload> {
+        if (isGlobalLockEnabled()) return lockFailure()
         return runCatching {
             val body = JSONObject().apply {
                 put("userId", request.userId)
@@ -104,6 +112,7 @@ class HttpOrchestratorGateway(
     }
 
     override fun submitHitlDecision(payload: HitlDecisionPayload): Result<Boolean> {
+        if (isGlobalLockEnabled()) return lockFailure()
         return runCatching {
             val body = JSONObject().apply {
                 put("planId", payload.planId)
@@ -121,6 +130,7 @@ class HttpOrchestratorGateway(
     }
 
     override fun executeStep(payload: ActionExecutionRequestPayload): Result<ActionExecutionResultPayload> {
+        if (isGlobalLockEnabled()) return lockFailure()
         return runCatching {
             val body = JSONObject().apply {
                 put("planId", payload.planId)
@@ -140,6 +150,7 @@ class HttpOrchestratorGateway(
     }
 
     override fun connectorStatus(userId: String): Result<List<ConnectorStatusPayload>> {
+        if (isGlobalLockEnabled()) return lockFailure()
         return runCatching {
             val (code, responseBody) = call("GET", "$baseUrl/v1/connectors/status?userId=$userId", null)
             if (code !in 200..299) {
@@ -164,10 +175,12 @@ class HttpOrchestratorGateway(
     }
 
     override fun authorizeConnector(connector: String, userId: String): Result<ConnectorAuthorizeResultPayload> {
+        if (isGlobalLockEnabled()) return lockFailure()
         return connectorMutation(endpoint = "authorize", connector = connector, userId = userId)
     }
 
     override fun disconnectConnector(connector: String, userId: String): Result<ConnectorAuthorizeResultPayload> {
+        if (isGlobalLockEnabled()) return lockFailure()
         return connectorMutation(endpoint = "disconnect", connector = connector, userId = userId)
     }
 
@@ -222,6 +235,15 @@ class HttpOrchestratorGateway(
                 message = raw.optString("message"),
             )
         }
+    }
+
+    private fun isGlobalLockEnabled(): Boolean {
+        val context = appContext ?: return false
+        return AppPrefs.isGlobalLockEnabled(context)
+    }
+
+    private fun <T> lockFailure(): Result<T> {
+        return Result.failure(IllegalStateException(lockBlockMessage))
     }
 
     private fun parseRiskLevel(value: String): RiskLevel {

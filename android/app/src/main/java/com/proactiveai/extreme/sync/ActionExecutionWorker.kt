@@ -16,9 +16,13 @@ class ActionExecutionWorker(
 ) : CoroutineWorker(appContext, params) {
 
     override suspend fun doWork(): Result {
+        if (AppPrefs.isGlobalLockEnabled(applicationContext)) {
+            return Result.success()
+        }
+
         val queueStore = ActionQueueStore.getInstance(applicationContext)
         val historyStore = ActionHistoryStore.getInstance(applicationContext)
-        val gateway = HttpOrchestratorGateway()
+        val gateway = HttpOrchestratorGateway(appContext = applicationContext)
 
         val runnable = queueStore.runnable(limit = 10)
         if (runnable.isEmpty()) {

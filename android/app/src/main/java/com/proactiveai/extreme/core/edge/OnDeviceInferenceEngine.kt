@@ -1,6 +1,7 @@
 package com.proactiveai.extreme.core.edge
 
 import android.content.Context
+import com.proactiveai.extreme.app.AppPrefs
 import com.proactiveai.extreme.core.context.IntentHint
 import com.proactiveai.extreme.orchestrator.ContextEventPayload
 import java.util.UUID
@@ -78,6 +79,10 @@ object OnDeviceInferenceEngine {
         events: List<ContextEventPayload>,
         runtimeConfig: LocalModelRuntimeConfig,
     ): EdgeInferenceTrace {
+        if (AppPrefs.isGlobalLockEnabled(context)) {
+            return blockedByGlobalLockTrace(model = model, mode = "context_window")
+        }
+
         val strategy = strategies[model] ?: FastHeuristicStrategy
         val heuristic = strategy.infer(events)
         val prompt = buildNativePrompt(events, heuristic)
@@ -114,6 +119,10 @@ object OnDeviceInferenceEngine {
         prompt: String,
         runtimeConfig: LocalModelRuntimeConfig,
     ): EdgeInferenceTrace {
+        if (AppPrefs.isGlobalLockEnabled(context)) {
+            return blockedByGlobalLockTrace(model = model, mode = "direct_prompt")
+        }
+
         val trimmedPrompt = prompt.trim()
         if (trimmedPrompt.isBlank()) {
             return EdgeInferenceTrace(
@@ -248,6 +257,34 @@ object OnDeviceInferenceEngine {
             .filter { it.isNotBlank() }
             .toList()
         return lines.firstOrNull { it.length >= 12 } ?: output.trim().take(160)
+    }
+
+    private fun blockedByGlobalLockTrace(
+        model: EdgeModelProfile,
+        mode: String,
+    ): EdgeInferenceTrace {
+        val lockMessage = "Global lock enabled: prompt inference is blocked."
+        return EdgeInferenceTrace(
+            result = EdgeInferenceResult(
+                model = model,
+                strategyLabel = "LOCKED",
+                summary = lockMessage,
+                urgencyScore = 0,
+                intentHints = listOf(
+                    IntentHint(
+                        label = "Global lock active",
+                        confidence = 1.0f,
+                        reason = "Disable lock to allow local or cloud model inference.",
+                    )
+                ),
+                suggestedActions = listOf("Disable Global Lock to run inference."),
+                nativeModelUsed = false,
+                nativeModelMessage = lockMessage,
+                nativeModelOutput = null,
+            ),
+            prompt = "[BLOCKED_BY_GLOBAL_LOCK]",
+            mode = "${mode}_blocked",
+        )
     }
 }
 

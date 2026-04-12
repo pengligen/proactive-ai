@@ -15,6 +15,8 @@ import com.proactiveai.extreme.core.context.ContextEvent
 import com.proactiveai.extreme.core.context.Sensitivity
 import com.proactiveai.extreme.core.context.engine.ContextEngine
 import com.proactiveai.extreme.core.context.engine.DefaultContextPluginFactory
+import com.proactiveai.extreme.orchestrator.toMap
+import com.proactiveai.extreme.storage.StoredContextEvent
 import com.proactiveai.extreme.storage.ContextEventStore
 import com.proactiveai.extreme.sync.SyncScheduler
 import kotlinx.coroutines.CoroutineScope
@@ -25,6 +27,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import org.json.JSONObject
+import java.util.Locale
 import java.util.UUID
 
 class ProactiveCollectionService : Service() {
@@ -37,6 +41,10 @@ class ProactiveCollectionService : Service() {
     private var stopRequested = false
     private var restartAttempted = false
     private var assistantAutoRunning = false
+    private var dailyFocusAutoRunning = false
+    private var cloudRefineRunning = false
+    private var lastAudioGateSignature = ""
+    private var lastAudioGateEventAt = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -86,21 +94,35 @@ class ProactiveCollectionService : Service() {
             while (isActive && running) {
                 val masterEnabled = AppPrefs.isMasterEnabled(this@ProactiveCollectionService)
                 if (masterEnabled) {
-                    val enabledPlugins = AppPrefs.getEnabledPlugins(this@ProactiveCollectionService)
-                    contextEngine.startEnabled(enabledPlugins)
-                    val eventsByPlugin = contextEngine.collectTickByPlugin(enabledPlugins)
+                    val store = ContextEventStore.getInstance(this@ProactiveCollectionService)
+                    val configuredPlugins = AppPrefs.getEnabledPlugins(this@ProactiveCollectionService)
+                    val audioGateDecision = buildAudioGateDecision(
+                        store = store,
+                        configuredPlugins = configuredPlugins,
+                    )
+                    val runtimePlugins = if (audioGateDecision.allowAudio) {
+                        configuredPlugins
+                    } else {
+                        configuredPlugins - AUDIO_PLUGIN_ID
+                    }
+
+                    contextEngine.startEnabled(runtimePlugins)
+                    val eventsByPlugin = contextEngine.collectTickByPlugin(runtimePlugins)
                     val events = eventsByPlugin.values.flatten().sortedBy { it.occurredAt }
                     val finalEvents = buildList {
                         if (events.isEmpty()) {
                             add(heartbeatEvent())
                         }
                         addAll(events)
-                        add(contextLogEvent(enabledPlugins, eventsByPlugin))
+                        add(contextLogEvent(runtimePlugins, eventsByPlugin))
+                        maybeBuildAudioGateEvent(audioGateDecision)?.let { add(it) }
                     }
 
-                    ContextEventStore.getInstance(this@ProactiveCollectionService).insertAll(finalEvents)
+                    store.insertAll(finalEvents)
                     SyncScheduler.enqueueImmediate(this@ProactiveCollectionService)
+                    maybeRunCloudSpeechRefine()
                     maybeRunAssistantAutoSession()
+                    maybeRunDailyFocusTop3()
                 }
 
                 delay(COLLECTION_INTERVAL_MS)
@@ -234,10 +256,197 @@ class ProactiveCollectionService : Service() {
         }
     }
 
+    private fun maybeRunCloudSpeechRefine() {
+        if (cloudRefineRunning) return
+        cloudRefineRunning = true
+        serviceScope.launch {
+            try {
+                CloudSpeechTranscriptionRefiner.runIfDue(this@ProactiveCollectionService)
+            } catch (_: Throwable) {
+            } finally {
+                cloudRefineRunning = false
+            }
+        }
+    }
+
+    private fun maybeRunDailyFocusTop3() {
+        if (dailyFocusAutoRunning) return
+        dailyFocusAutoRunning = true
+        serviceScope.launch {
+            try {
+                DailyFocusTop3AutoRunner.runIfDue(this@ProactiveCollectionService)
+            } catch (_: Throwable) {
+            } finally {
+                dailyFocusAutoRunning = false
+            }
+        }
+    }
+
+    private fun buildAudioGateDecision(
+        store: ContextEventStore,
+        configuredPlugins: Set<String>,
+    ): AudioGateDecision {
+        if (AUDIO_PLUGIN_ID !in configuredPlugins) {
+            return AudioGateDecision(
+                allowAudio = false,
+                reason = "audio_plugin_disabled",
+                payload = mapOf("configured" to false),
+            )
+        }
+
+        val now = System.currentTimeMillis()
+        val recentRows = store.getRecent(limit = 320)
+            .filter { row -> now - row.occurredAt <= AUDIO_GATE_LOOKBACK_MS }
+
+        val sensorPayload = recentRows
+            .firstOrNull { row -> row.source == "sensor_fusion" || row.category == "sensor" }
+            ?.payloadMap()
+            .orEmpty()
+        val devicePayload = recentRows
+            .firstOrNull { row -> row.source == "system_device" || row.category == "device_state" }
+            ?.payloadMap()
+            .orEmpty()
+        val locationPayload = recentRows
+            .firstOrNull { row -> row.source == "location_motion" || row.category == "location" }
+            ?.payloadMap()
+            .orEmpty()
+
+        val activityState = payloadString(sensorPayload, "activityState")
+        val ambientState = payloadString(sensorPayload, "ambientState")
+        val lightLux = payloadDouble(sensorPayload, "lightLux")
+        val stepDelta = payloadInt(sensorPayload, "stepDelta")
+        val motionState = payloadString(locationPayload, "motionState")
+        val isInteractive = payloadBoolean(devicePayload, "isInteractive")
+        val isDeviceIdle = payloadBoolean(devicePayload, "isDeviceIdleMode")
+
+        val hasRecentSpeech = recentRows.any { row ->
+            row.category == "audio" &&
+                now - row.occurredAt <= AUDIO_GATE_SPEECH_RECENT_MS &&
+                (
+                    row.summary.startsWith("Ambient speech transcript", ignoreCase = true) ||
+                        row.summary.contains("cloud-refined", ignoreCase = true)
+                    )
+        }
+
+        val motionActive = activityState in setOf("walking", "running", "moving") ||
+            stepDelta > 0 ||
+            motionState in setOf("walking", "running", "driving", "cycling_or_transit")
+        val stillLike = (activityState.isBlank() || activityState in setOf("still", "unknown")) &&
+            stepDelta <= 0 &&
+            (motionState.isBlank() || motionState in setOf("still", "unknown"))
+        val darkLike = ambientState.startsWith("dark") || (lightLux != null && lightLux < 10.0)
+        val indoorLike = ambientState.contains("indoor") || ambientState.startsWith("dark") || (lightLux != null && lightLux < 80.0)
+        val screenInactive = (isInteractive == false) || (isDeviceIdle == true)
+        val indoorInactive = indoorLike && stillLike && screenInactive && !hasRecentSpeech
+        val gateByDarkIndoorInactive = darkLike && indoorInactive
+        val allowAudio = !gateByDarkIndoorInactive
+
+        val reason = if (allowAudio) {
+            "active_or_partial_context"
+        } else {
+            "dark_and_indoor_inactive"
+        }
+
+        return AudioGateDecision(
+            allowAudio = allowAudio,
+            reason = reason,
+            payload = mapOf(
+                "configured" to true,
+                "activityState" to activityState.ifBlank { "unknown" },
+                "ambientState" to ambientState.ifBlank { "unknown" },
+                "lightLux" to (lightLux ?: -1.0),
+                "stepDelta" to stepDelta,
+                "motionState" to motionState.ifBlank { "unknown" },
+                "isInteractive" to (isInteractive ?: "unknown"),
+                "isDeviceIdleMode" to (isDeviceIdle ?: "unknown"),
+                "hasRecentSpeech" to hasRecentSpeech,
+                "motionActive" to motionActive,
+                "darkLike" to darkLike,
+                "indoorLike" to indoorLike,
+                "stillLike" to stillLike,
+                "screenInactive" to screenInactive,
+                "indoorInactive" to indoorInactive,
+                "gateByDarkIndoorInactive" to gateByDarkIndoorInactive,
+            ),
+        )
+    }
+
+    private fun maybeBuildAudioGateEvent(decision: AudioGateDecision): ContextEvent? {
+        val now = System.currentTimeMillis()
+        val signature = "${decision.allowAudio}|${decision.reason}|${decision.payload["hour"]}|${decision.payload["activityState"]}|${decision.payload["ambientState"]}|${decision.payload["motionState"]}"
+        val shouldEmit = signature != lastAudioGateSignature || now - lastAudioGateEventAt >= AUDIO_GATE_EMIT_INTERVAL_MS
+        if (!shouldEmit) return null
+
+        lastAudioGateSignature = signature
+        lastAudioGateEventAt = now
+
+        val mode = if (decision.allowAudio) "ACTIVE" else "PAUSED"
+        return ContextEvent(
+            eventId = UUID.randomUUID().toString(),
+            occurredAt = now,
+            source = "collection_service",
+            category = "audio_gate",
+            summary = "Audio gate $mode | reason=${decision.reason}",
+            payload = mapOf(
+                "allowAudio" to decision.allowAudio,
+                "reason" to decision.reason,
+            ) + decision.payload,
+            sensitivity = Sensitivity.MEDIUM,
+            ttlSeconds = 7 * 24 * 3600,
+        )
+    }
+
+    private fun StoredContextEvent.payloadMap(): Map<String, Any?> {
+        return kotlin.runCatching { JSONObject(payloadJson).toMap() }.getOrDefault(emptyMap())
+    }
+
+    private fun payloadString(payload: Map<String, Any?>, key: String): String {
+        return payload[key]?.toString()?.trim()?.lowercase(Locale.US).orEmpty()
+    }
+
+    private fun payloadBoolean(payload: Map<String, Any?>, key: String): Boolean? {
+        return when (val value = payload[key]) {
+            is Boolean -> value
+            is Number -> value.toInt() != 0
+            is String -> when (value.trim().lowercase(Locale.US)) {
+                "true", "1", "yes" -> true
+                "false", "0", "no" -> false
+                else -> null
+            }
+            else -> null
+        }
+    }
+
+    private fun payloadDouble(payload: Map<String, Any?>, key: String): Double? {
+        return when (val value = payload[key]) {
+            is Number -> value.toDouble()
+            is String -> value.toDoubleOrNull()
+            else -> null
+        }
+    }
+
+    private fun payloadInt(payload: Map<String, Any?>, key: String): Int {
+        return when (val value = payload[key]) {
+            is Number -> value.toInt()
+            is String -> value.toIntOrNull()
+            else -> null
+        } ?: 0
+    }
+
+    private data class AudioGateDecision(
+        val allowAudio: Boolean,
+        val reason: String,
+        val payload: Map<String, Any>,
+    )
+
     companion object {
         private const val CHANNEL_ID = "proactive_collection"
         private const val NOTIFICATION_ID = 1001
         private const val COLLECTION_INTERVAL_MS = 60_000L
+        private const val AUDIO_PLUGIN_ID = "audio_ambient"
+        private const val AUDIO_GATE_LOOKBACK_MS = 15 * 60_000L
+        private const val AUDIO_GATE_SPEECH_RECENT_MS = 10 * 60_000L
+        private const val AUDIO_GATE_EMIT_INTERVAL_MS = 5 * 60_000L
 
         const val ACTION_START = "com.proactiveai.extreme.service.START"
         const val ACTION_STOP = "com.proactiveai.extreme.service.STOP"

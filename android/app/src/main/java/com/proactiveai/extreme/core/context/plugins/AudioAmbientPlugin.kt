@@ -33,6 +33,7 @@ import com.proactiveai.extreme.core.edge.LiteRtLmRuntime
 import com.proactiveai.extreme.core.edge.LocalModelBackend
 import com.proactiveai.extreme.core.edge.LocalModelRuntimeConfig
 import com.proactiveai.extreme.core.model.PluginDescriptor
+import com.proactiveai.extreme.service.CloudSpeechTranscriptionRefiner
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -82,6 +83,7 @@ class AudioAmbientPlugin(
         workerScope = scope
         workerJob = scope.launch {
             val sttMode = when {
+                ENABLE_DIRECT_CLOUD_STT -> "manual_direct_cloud_plus_ambient_batch_cloud"
                 ENABLE_EXPERIMENTAL_LITERT_AUDIO_STT -> "litert_lm_audio_stt"
                 ENABLE_MLKIT_GENAI_STT -> "mlkit_genai_file_stt"
                 ENABLE_ANDROID_FILE_STT -> "android_file_stt"
@@ -144,6 +146,24 @@ class AudioAmbientPlugin(
             voiceLikely = true,
             noisyLikely = false,
         )
+        if (ENABLE_DIRECT_CLOUD_STT) {
+            val outcome = transcribeWithCloudDirect(
+                wavPath = wavFile.absolutePath,
+                manualTrigger = true,
+                timeoutMs = CLOUD_DIRECT_TIMEOUT_MS,
+            )
+            return ReplayOutcome(
+                status = outcome.status,
+                strategy = "gpt-4o-transcribe",
+                reason = if (outcome.status == "recognized") null else outcome.detail,
+                modelStatus = outcome.detail,
+                transcript = outcome.transcript.takeIf { it.isNotBlank() },
+                metaPath = File(wavFile.parentFile, "${wavFile.nameWithoutExtension}.json")
+                    .takeIf { it.exists() }
+                    ?.absolutePath,
+            )
+        }
+
         val transcription = when {
             ENABLE_ANDROID_FILE_STT -> transcribeWithAndroidRecognizer(clip)
             ENABLE_EXPERIMENTAL_LITERT_AUDIO_STT -> transcribeWithLiteRt(clip)
@@ -236,6 +256,270 @@ class AudioAmbientPlugin(
         }
     }
 
+    suspend fun captureManualIntakeOnce(
+        shouldStop: (() -> Boolean)? = null,
+        deferCloudTranscription: Boolean = false,
+    ): ManualIntakeOutcome {
+        if (!hasMicrophonePermission()) {
+            return ManualIntakeOutcome(
+                status = "permission_missing",
+                strategy = "manual_intake",
+                reason = "record_audio_permission_missing",
+                modelStatus = "Microphone permission missing.",
+                transcript = null,
+                wavPath = null,
+                metaPath = null,
+                durationMs = null,
+                clipRmsDb = null,
+                clipPeakDb = null,
+            )
+        }
+
+        val probe = captureAmbientProbe()
+            ?: AmbientProbe(
+                rmsDb = -120f,
+                peakDb = -120f,
+                voiceLikely = false,
+                noisyLikely = false,
+            )
+
+        val holdToTalk = shouldStop != null
+        val clip = recordSpeechClipToWav(
+            maxDurationMs = if (holdToTalk) MANUAL_HOLD_CAPTURE_MAX_MS else CAPTURE_MAX_MS,
+            stopOnSilence = !holdToTalk,
+            shouldStop = shouldStop,
+            minTotalMs = if (holdToTalk) MANUAL_HOLD_CAPTURE_MIN_TOTAL_MS else CAPTURE_MIN_TOTAL_MS,
+        )
+        if (clip == null) {
+            return ManualIntakeOutcome(
+                status = "error",
+                strategy = "manual_intake",
+                reason = if (holdToTalk) "audio_clip_too_short_or_capture_failed" else "audio_clip_capture_failed",
+                modelStatus = if (holdToTalk) {
+                    "Manual intake recording failed or was too short. Hold for at least ${MANUAL_HOLD_CAPTURE_MIN_TOTAL_MS}ms."
+                } else {
+                    "Manual intake recording failed."
+                },
+                transcript = null,
+                wavPath = null,
+                metaPath = null,
+                durationMs = null,
+                clipRmsDb = null,
+                clipPeakDb = null,
+            )
+        }
+
+        if (holdToTalk && deferCloudTranscription) {
+            val metaPath = persistClipMeta(
+                clip = clip,
+                probe = probe,
+                status = "captured_untranscribed",
+                strategy = "manual_hold_capture_only",
+                transcript = null,
+                reason = "awaiting_cloud_transcription",
+                modelStatus = "WAV captured. Pending async cloud transcription.",
+            )
+            return ManualIntakeOutcome(
+                status = "captured_untranscribed",
+                strategy = "manual_hold_capture_only",
+                reason = "awaiting_cloud_transcription",
+                modelStatus = "WAV captured. Pending async cloud transcription.",
+                transcript = null,
+                wavPath = clip.file.absolutePath,
+                metaPath = metaPath,
+                durationMs = clip.durationMs,
+                clipRmsDb = clip.rmsDb,
+                clipPeakDb = clip.peakDb,
+            )
+        }
+
+        if (ENABLE_DIRECT_CLOUD_STT) {
+            val metaPath = persistClipMeta(
+                clip = clip,
+                probe = probe,
+                status = "captured_untranscribed",
+                strategy = "gpt-4o-transcribe-pending",
+                transcript = null,
+                reason = "pending_cloud_transcription",
+                modelStatus = null,
+            )
+            val cloud = transcribeWithCloudDirect(
+                wavPath = clip.file.absolutePath,
+                manualTrigger = true,
+                timeoutMs = CLOUD_DIRECT_TIMEOUT_MS,
+            )
+            return when (cloud.status) {
+                "recognized" -> ManualIntakeOutcome(
+                    status = "recognized",
+                    strategy = "gpt-4o-transcribe",
+                    reason = null,
+                    modelStatus = cloud.detail,
+                    transcript = cloud.transcript.takeIf { it.isNotBlank() },
+                    wavPath = clip.file.absolutePath,
+                    metaPath = metaPath,
+                    durationMs = clip.durationMs,
+                    clipRmsDb = clip.rmsDb,
+                    clipPeakDb = clip.peakDb,
+                )
+
+                "no_speech" -> ManualIntakeOutcome(
+                    status = "no_speech",
+                    strategy = "gpt-4o-transcribe",
+                    reason = "no_clear_speech",
+                    modelStatus = cloud.detail,
+                    transcript = null,
+                    wavPath = clip.file.absolutePath,
+                    metaPath = metaPath,
+                    durationMs = clip.durationMs,
+                    clipRmsDb = clip.rmsDb,
+                    clipPeakDb = clip.peakDb,
+                )
+
+                "blocked" -> ManualIntakeOutcome(
+                    status = "blocked",
+                    strategy = "gpt-4o-transcribe",
+                    reason = "cloud_transcription_blocked",
+                    modelStatus = cloud.detail,
+                    transcript = null,
+                    wavPath = clip.file.absolutePath,
+                    metaPath = metaPath,
+                    durationMs = clip.durationMs,
+                    clipRmsDb = clip.rmsDb,
+                    clipPeakDb = clip.peakDb,
+                )
+
+                else -> ManualIntakeOutcome(
+                    status = "error",
+                    strategy = "gpt-4o-transcribe",
+                    reason = "cloud_transcription_failed",
+                    modelStatus = cloud.detail,
+                    transcript = null,
+                    wavPath = clip.file.absolutePath,
+                    metaPath = metaPath,
+                    durationMs = clip.durationMs,
+                    clipRmsDb = clip.rmsDb,
+                    clipPeakDb = clip.peakDb,
+                )
+            }
+        }
+
+        val transcription = when {
+            ENABLE_ANDROID_FILE_STT -> transcribeWithAndroidRecognizer(
+                clip = clip,
+                fastMode = holdToTalk,
+            )
+            ENABLE_EXPERIMENTAL_LITERT_AUDIO_STT -> transcribeWithLiteRt(clip)
+            ENABLE_MLKIT_GENAI_STT -> transcribeWithMlKitGenAi(clip, allowFallback = true)
+            else -> TranscriptionResult.Skipped(
+                reason = "all_audio_stt_disabled",
+                strategy = "capture_only",
+            )
+        }
+
+        return when (transcription) {
+            is TranscriptionResult.Recognized -> {
+                val stitchedTranscript = buildStitchedTranscript(
+                    transcript = transcription.transcript,
+                    now = System.currentTimeMillis(),
+                )
+                val metaPath = persistClipMeta(
+                    clip = clip,
+                    probe = probe,
+                    status = "recognized",
+                    strategy = transcription.strategy,
+                    transcript = transcription.transcript,
+                    stitchedTranscript = stitchedTranscript,
+                    reason = null,
+                    modelStatus = transcription.modelStatus,
+                )
+                ManualIntakeOutcome(
+                    status = "recognized",
+                    strategy = transcription.strategy,
+                    reason = null,
+                    modelStatus = transcription.modelStatus,
+                    transcript = transcription.transcript,
+                    wavPath = clip.file.absolutePath,
+                    metaPath = metaPath,
+                    durationMs = clip.durationMs,
+                    clipRmsDb = clip.rmsDb,
+                    clipPeakDb = clip.peakDb,
+                )
+            }
+
+            is TranscriptionResult.NoSpeech -> {
+                val metaPath = persistClipMeta(
+                    clip = clip,
+                    probe = probe,
+                    status = "no_speech",
+                    strategy = transcription.strategy,
+                    transcript = null,
+                    reason = "no_clear_speech",
+                    modelStatus = null,
+                )
+                ManualIntakeOutcome(
+                    status = "no_speech",
+                    strategy = transcription.strategy,
+                    reason = "no_clear_speech",
+                    modelStatus = "",
+                    transcript = null,
+                    wavPath = clip.file.absolutePath,
+                    metaPath = metaPath,
+                    durationMs = clip.durationMs,
+                    clipRmsDb = clip.rmsDb,
+                    clipPeakDb = clip.peakDb,
+                )
+            }
+
+            is TranscriptionResult.Error -> {
+                val metaPath = persistClipMeta(
+                    clip = clip,
+                    probe = probe,
+                    status = "error",
+                    strategy = transcription.strategy,
+                    transcript = null,
+                    reason = transcription.reason,
+                    modelStatus = transcription.modelStatus,
+                )
+                ManualIntakeOutcome(
+                    status = "error",
+                    strategy = transcription.strategy,
+                    reason = transcription.reason,
+                    modelStatus = transcription.modelStatus,
+                    transcript = null,
+                    wavPath = clip.file.absolutePath,
+                    metaPath = metaPath,
+                    durationMs = clip.durationMs,
+                    clipRmsDb = clip.rmsDb,
+                    clipPeakDb = clip.peakDb,
+                )
+            }
+
+            is TranscriptionResult.Skipped -> {
+                val metaPath = persistClipMeta(
+                    clip = clip,
+                    probe = probe,
+                    status = "captured_untranscribed",
+                    strategy = transcription.strategy,
+                    transcript = null,
+                    reason = transcription.reason,
+                    modelStatus = null,
+                )
+                ManualIntakeOutcome(
+                    status = "captured_untranscribed",
+                    strategy = transcription.strategy,
+                    reason = transcription.reason,
+                    modelStatus = "",
+                    transcript = null,
+                    wavPath = clip.file.absolutePath,
+                    metaPath = metaPath,
+                    durationMs = clip.durationMs,
+                    clipRmsDb = clip.rmsDb,
+                    clipPeakDb = clip.peakDb,
+                )
+            }
+        }
+    }
+
     private suspend fun continuousCaptureLoop() {
         while (workerJob?.isActive == true) {
             if (!hasMicrophonePermission()) {
@@ -272,6 +556,31 @@ class AudioAmbientPlugin(
                     ),
                 )
                 delay(ERROR_RETRY_MS)
+                continue
+            }
+
+            if (ENABLE_DIRECT_CLOUD_STT) {
+                val metaPath = persistClipMeta(
+                    clip = clip,
+                    probe = probe,
+                    status = "captured_untranscribed",
+                    strategy = "gpt-4o-transcribe-pending",
+                    transcript = null,
+                    reason = "pending_cloud_transcription",
+                    modelStatus = null,
+                )
+                enqueueEvent(
+                    summary = "Audio clip captured and queued for batch cloud transcription.",
+                    payload = mapOf(
+                        "status" to "batch_cloud_transcription_pending",
+                        "strategy" to "gpt-4o-transcribe",
+                        "clipMs" to clip.durationMs,
+                        "wavPath" to clip.file.absolutePath,
+                        "metaPath" to metaPath.orEmpty(),
+                    ),
+                )
+                enforceClipRetention()
+                delay(AFTER_CYCLE_DELAY_MS)
                 continue
             }
 
@@ -490,6 +799,24 @@ class AudioAmbientPlugin(
             }
         }
         return "$prev $nxt".replace(Regex("\\s+"), " ").trim()
+    }
+
+    private suspend fun transcribeWithCloudDirect(
+        wavPath: String,
+        manualTrigger: Boolean,
+        timeoutMs: Long,
+    ): CloudSpeechTranscriptionRefiner.SingleClipOutcome {
+        return withTimeoutOrNull(timeoutMs) {
+            CloudSpeechTranscriptionRefiner.transcribeSingleClip(
+                context = context,
+                wavPath = wavPath,
+                manualTrigger = manualTrigger,
+            )
+        } ?: CloudSpeechTranscriptionRefiner.SingleClipOutcome(
+            status = "error",
+            transcript = "",
+            detail = "Cloud transcription timeout after ${timeoutMs}ms.",
+        )
     }
 
     private fun pickBetterSuccess(
@@ -1093,7 +1420,10 @@ class AudioAmbientPlugin(
         }
     }
 
-    private suspend fun transcribeWithAndroidRecognizer(clip: AudioClip): TranscriptionResult {
+    private suspend fun transcribeWithAndroidRecognizer(
+        clip: AudioClip,
+        fastMode: Boolean = false,
+    ): TranscriptionResult {
         val strategy = "android_file_stt"
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
             return TranscriptionResult.Error(
@@ -1116,21 +1446,33 @@ class AudioAmbientPlugin(
         val defaultIsChinese =
             normalizedDefaultLang?.startsWith("zh") == true ||
                 normalizedDefaultLang?.startsWith("cmn") == true
-        val languageCandidates = buildList<String?> {
-            if (!defaultLanguageTag.isNullOrBlank()) add(defaultLanguageTag)
-            add(null) // Do not assume locale support; allow auto routing.
-            if (defaultIsChinese) {
-                if (normalizedDefaultLang != "zh-cn") add("zh-CN")
-                if (normalizedDefaultLang != "cmn-hans-cn") add("cmn-Hans-CN")
-                if (normalizedDefaultLang != "zh-tw") add("zh-TW")
-                if (normalizedDefaultLang != "en-us") add("en-US")
-            } else {
-                if (normalizedDefaultLang != "en-us") add("en-US")
-                if (normalizedDefaultLang != "zh-cn") add("zh-CN")
-                if (normalizedDefaultLang != "cmn-hans-cn") add("cmn-Hans-CN")
-                if (normalizedDefaultLang != "zh-tw") add("zh-TW")
-            }
-        }.distinct()
+        val languageCandidates = if (fastMode) {
+            buildList<String?> {
+                if (!defaultLanguageTag.isNullOrBlank()) add(defaultLanguageTag)
+                add(null) // Let recognizer auto-route first for speed.
+                if (defaultIsChinese) {
+                    if (normalizedDefaultLang != "zh-cn") add("zh-CN")
+                } else {
+                    if (normalizedDefaultLang != "en-us") add("en-US")
+                }
+            }.distinct()
+        } else {
+            buildList<String?> {
+                if (!defaultLanguageTag.isNullOrBlank()) add(defaultLanguageTag)
+                add(null) // Do not assume locale support; allow auto routing.
+                if (defaultIsChinese) {
+                    if (normalizedDefaultLang != "zh-cn") add("zh-CN")
+                    if (normalizedDefaultLang != "cmn-hans-cn") add("cmn-Hans-CN")
+                    if (normalizedDefaultLang != "zh-tw") add("zh-TW")
+                    if (normalizedDefaultLang != "en-us") add("en-US")
+                } else {
+                    if (normalizedDefaultLang != "en-us") add("en-US")
+                    if (normalizedDefaultLang != "zh-cn") add("zh-CN")
+                    if (normalizedDefaultLang != "cmn-hans-cn") add("cmn-Hans-CN")
+                    if (normalizedDefaultLang != "zh-tw") add("zh-TW")
+                }
+            }.distinct()
+        }
 
         val engineSequence = if (SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
             listOf(true, false) // Layer 1: on-device, then layer 2: default service.
@@ -1151,6 +1493,11 @@ class AudioAmbientPlugin(
                 )
             }
         }
+        val scopedAttempts = if (fastMode) {
+            attempts.take(MANUAL_FAST_MAX_STT_ATTEMPTS)
+        } else {
+            attempts
+        }
 
         val pcmFile = writeTempPcmFromWav(clip.file)
         if (pcmFile == null) {
@@ -1168,19 +1515,20 @@ class AudioAmbientPlugin(
             var bestPartialOutcome: AndroidSpeechOutcome.Partial? = null
             var sawNoMatch = false
             var lastErrorOutcome: AndroidSpeechOutcome.Error? = null
-            for ((index, attempt) in attempts.withIndex()) {
+            for ((index, attempt) in scopedAttempts.withIndex()) {
                 val outcome = withContext(Dispatchers.Main) {
                     transcribePcmWithSpeechRecognizer(
                         pcmFile = pcmFile,
                         attempt = attempt,
+                        timeoutMs = if (fastMode) MANUAL_FAST_STT_TIMEOUT_MS else FILE_STT_TIMEOUT_MS,
                     )
                 }
                 when (outcome) {
                     is AndroidSpeechOutcome.Success -> {
                         if (attempt.useOnDevice) {
                             bestOnDeviceSuccess = pickBetterSuccess(bestOnDeviceSuccess, outcome)
-                            val hasDefaultRemaining = attempts
-                                .subList(index + 1, attempts.size)
+                            val hasDefaultRemaining = scopedAttempts
+                                .subList(index + 1, scopedAttempts.size)
                                 .any { !it.useOnDevice }
                             if (hasDefaultRemaining) {
                                 continue
@@ -1198,21 +1546,21 @@ class AudioAmbientPlugin(
                             bestPartialOutcome = outcome
                         }
                         attemptErrors += "${attempt.name}:partial(${outcome.reason})"
-                        if (index != attempts.lastIndex) {
+                        if (index != scopedAttempts.lastIndex) {
                             delay(RETRY_ATTEMPT_DELAY_MS)
                         }
                     }
                     is AndroidSpeechOutcome.NoMatch -> {
                         sawNoMatch = true
                         attemptErrors += "${attempt.name}:${outcome.reason}"
-                        if (index != attempts.lastIndex) {
+                        if (index != scopedAttempts.lastIndex) {
                             delay(RETRY_ATTEMPT_DELAY_MS)
                         }
                     }
                     is AndroidSpeechOutcome.Error -> {
                         lastErrorOutcome = outcome
                         attemptErrors += "${attempt.name}:${outcome.reason}"
-                        if (!shouldRetrySttAttempt(outcome.reason) || index == attempts.lastIndex) {
+                        if (!shouldRetrySttAttempt(outcome.reason) || index == scopedAttempts.lastIndex) {
                             break
                         }
                         delay(RETRY_ATTEMPT_DELAY_MS)
@@ -1369,6 +1717,7 @@ class AudioAmbientPlugin(
     private suspend fun transcribePcmWithSpeechRecognizer(
         pcmFile: File,
         attempt: SttAttempt,
+        timeoutMs: Long = FILE_STT_TIMEOUT_MS,
     ): AndroidSpeechOutcome {
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
             return AndroidSpeechOutcome.Error(
@@ -1401,7 +1750,7 @@ class AudioAmbientPlugin(
             )
         }
 
-        val result = withTimeoutOrNull(FILE_STT_TIMEOUT_MS) {
+        val result = withTimeoutOrNull(timeoutMs) {
             suspendCancellableCoroutine<AndroidSpeechOutcome> { continuation ->
                 var finished = false
                 var partialText = ""
@@ -1527,7 +1876,7 @@ class AudioAmbientPlugin(
             }
         } ?: AndroidSpeechOutcome.Error(
             reason = "speech_stt_timeout",
-            detail = "SpeechRecognizer timed out after ${FILE_STT_TIMEOUT_MS}ms",
+            detail = "SpeechRecognizer timed out after ${timeoutMs}ms",
         )
 
         kotlin.runCatching { recognizer.cancel() }
@@ -1729,7 +2078,12 @@ class AudioAmbientPlugin(
         )
     }
 
-    private fun recordSpeechClipToWav(): AudioClip? {
+    private fun recordSpeechClipToWav(
+        maxDurationMs: Long = CAPTURE_MAX_MS,
+        stopOnSilence: Boolean = true,
+        shouldStop: (() -> Boolean)? = null,
+        minTotalMs: Long = CAPTURE_MIN_TOTAL_MS,
+    ): AudioClip? {
         val minBufferSize = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
@@ -1765,7 +2119,11 @@ class AudioAmbientPlugin(
         try {
             audioRecord.startRecording()
             val start = SystemClock.elapsedRealtime()
-            while (SystemClock.elapsedRealtime() - start < CAPTURE_MAX_MS) {
+            while (SystemClock.elapsedRealtime() - start < maxDurationMs) {
+                val elapsedMs = SystemClock.elapsedRealtime() - start
+                if (shouldStop?.invoke() == true && elapsedMs >= minTotalMs) {
+                    break
+                }
                 val read = audioRecord.read(frame, 0, frame.size)
                 if (read <= 0) continue
 
@@ -1799,7 +2157,7 @@ class AudioAmbientPlugin(
 
                 val canStopForSilence =
                     accumulatedSpeechMs >= CAPTURE_MIN_SPEECH_MS && trailingSilenceMs >= CAPTURE_END_SILENCE_MS
-                if (canStopForSilence) {
+                if (stopOnSilence && canStopForSilence) {
                     break
                 }
             }
@@ -1812,7 +2170,7 @@ class AudioAmbientPlugin(
 
         if (totalSamples <= 0L) return null
         val durationMs = (totalSamples * 1000L) / SAMPLE_RATE
-        if (durationMs < CAPTURE_MIN_TOTAL_MS) return null
+        if (durationMs < minTotalMs) return null
 
         val pcmBytes = pcmBuffer.toByteArray()
         val outputDir = File(context.filesDir, "audio_capture").apply { mkdirs() }
@@ -2084,6 +2442,19 @@ class AudioAmbientPlugin(
         val metaPath: String?,
     )
 
+    data class ManualIntakeOutcome(
+        val status: String,
+        val strategy: String,
+        val reason: String?,
+        val modelStatus: String,
+        val transcript: String?,
+        val wavPath: String?,
+        val metaPath: String?,
+        val durationMs: Long?,
+        val clipRmsDb: Float?,
+        val clipPeakDb: Float?,
+    )
+
     private data class SttAttempt(
         val useOnDevice: Boolean,
         val preferOffline: Boolean,
@@ -2148,6 +2519,8 @@ class AudioAmbientPlugin(
         private const val AFTER_CYCLE_DELAY_MS = 800L
 
         private const val CAPTURE_MAX_MS = 28_000L
+        private const val MANUAL_HOLD_CAPTURE_MAX_MS = 5 * 60_000L
+        private const val MANUAL_HOLD_CAPTURE_MIN_TOTAL_MS = 300L
         private const val CAPTURE_MIN_TOTAL_MS = 800L
         private const val CAPTURE_MIN_SPEECH_MS = 1_200L
         private const val CAPTURE_END_SILENCE_MS = 3_600L
@@ -2175,13 +2548,17 @@ class AudioAmbientPlugin(
         private const val WAV_TTL_MS = 48L * 60L * 60L * 1000L
         private const val WAV_HEADER_BYTES = 44
         private const val FILE_STT_TIMEOUT_MS = 22_000L
+        private const val MANUAL_FAST_STT_TIMEOUT_MS = 7_000L
+        private const val MANUAL_FAST_MAX_STT_ATTEMPTS = 4
         private const val MLKIT_DOWNLOAD_TIMEOUT_MS = 180_000L
         private const val RETRY_ATTEMPT_DELAY_MS = 260L
+        private const val CLOUD_DIRECT_TIMEOUT_MS = 90_000L
 
         // LiteRT-LM multimodal audio path currently crashes native library on some devices.
+        private const val ENABLE_DIRECT_CLOUD_STT = true
         private const val ENABLE_EXPERIMENTAL_LITERT_AUDIO_STT = false
         private const val ENABLE_MLKIT_GENAI_STT = false
-        private const val ENABLE_ANDROID_FILE_STT = true
+        private const val ENABLE_ANDROID_FILE_STT = false
         private const val ENABLE_ANDROID_STT_FALLBACK_AFTER_MLKIT = true
     }
 }

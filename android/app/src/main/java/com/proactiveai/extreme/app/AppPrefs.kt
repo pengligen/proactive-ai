@@ -24,6 +24,10 @@ object AppPrefs {
     private const val KEY_LOCAL_LLAMA_THREADS = "local_llama_threads"
     private const val KEY_HF_TOKEN = "huggingface_token"
     private const val KEY_ASSISTANT_LAST_SESSION_BUCKET = "assistant_last_session_bucket"
+    private const val KEY_OPENAI_API_KEY = "openai_api_key"
+    private const val KEY_AUDIO_REFINE_LAST_BUCKET = "audio_refine_last_bucket"
+    private const val KEY_DAILY_FOCUS_LAST_DATE = "daily_focus_last_date"
+    private const val KEY_GLOBAL_LOCK_ENABLED = "global_lock_enabled"
 
     private const val KEY_METRIC_SUGGESTIONS_TOTAL = "metric_suggestions_total"
     private const val KEY_METRIC_SUGGESTIONS_ACCEPTED = "metric_suggestions_accepted"
@@ -183,6 +187,38 @@ object AppPrefs {
 
     fun setAssistantLastSessionBucket(context: Context, bucket: Long) {
         prefs(context).edit().putLong(KEY_ASSISTANT_LAST_SESSION_BUCKET, bucket).apply()
+    }
+
+    fun getOpenAiApiKey(context: Context): String {
+        return prefs(context).getString(KEY_OPENAI_API_KEY, "").orEmpty()
+    }
+
+    fun setOpenAiApiKey(context: Context, apiKey: String) {
+        prefs(context).edit().putString(KEY_OPENAI_API_KEY, apiKey).apply()
+    }
+
+    fun getAudioRefineLastBucket(context: Context): Long {
+        return prefs(context).getLong(KEY_AUDIO_REFINE_LAST_BUCKET, -1L)
+    }
+
+    fun setAudioRefineLastBucket(context: Context, bucket: Long) {
+        prefs(context).edit().putLong(KEY_AUDIO_REFINE_LAST_BUCKET, bucket).apply()
+    }
+
+    fun getDailyFocusLastDate(context: Context): String {
+        return prefs(context).getString(KEY_DAILY_FOCUS_LAST_DATE, "").orEmpty()
+    }
+
+    fun setDailyFocusLastDate(context: Context, dateToken: String) {
+        prefs(context).edit().putString(KEY_DAILY_FOCUS_LAST_DATE, dateToken).apply()
+    }
+
+    fun isGlobalLockEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_GLOBAL_LOCK_ENABLED, false)
+    }
+
+    fun setGlobalLockEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_GLOBAL_LOCK_ENABLED, enabled).apply()
     }
 
     fun getEvaluationMetrics(context: Context): EvaluationMetrics {

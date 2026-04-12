@@ -14,6 +14,11 @@ val hfToken = providers.gradleProperty("HF_TOKEN")
     .orNull
     .orEmpty()
 
+val openAiApiKey = providers.gradleProperty("OPENAI_API_KEY")
+    .orElse(providers.environmentVariable("OPENAI_API_KEY"))
+    .orNull
+    .orEmpty()
+
 android {
     namespace = "com.proactiveai.extreme"
     compileSdk = 35
@@ -31,6 +36,7 @@ android {
         }
 
         buildConfigField("String", "HF_TOKEN", "\"${escapeBuildConfigString(hfToken)}\"")
+        buildConfigField("String", "OPENAI_API_KEY", "\"${escapeBuildConfigString(openAiApiKey)}\"")
         buildConfigField(
             "String",
             "DEFAULT_GEMMA_E2B_TASK_URL",
