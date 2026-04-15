@@ -1,6 +1,8 @@
 package com.proactiveai.extreme.ui.permission
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.location.Geocoder
 import android.media.MediaPlayer
 import android.net.Uri
@@ -74,6 +76,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.proactiveai.extreme.app.AppPrefs
@@ -101,6 +104,7 @@ import com.proactiveai.extreme.orchestrator.PlanRequestPayload
 import com.proactiveai.extreme.orchestrator.toMap
 import com.proactiveai.extreme.permission.PermissionStatusResolver
 import com.proactiveai.extreme.service.AssistantSessionAutoRunner
+import com.proactiveai.extreme.service.CloudSpeechTranscriptionRefiner
 import com.proactiveai.extreme.service.DailyFocusTop3AutoRunner
 import com.proactiveai.extreme.service.ProactiveCollectionService
 import com.proactiveai.extreme.storage.ContextEventStore
@@ -127,11 +131,12 @@ private val CONTEXT_CARD_SCROLL_MAX_HEIGHT = 420.dp
 private const val MODEL_JOURNAL_MAX_ITEMS = 20
 private val MODEL_JOURNAL_SCROLL_MAX_HEIGHT = 520.dp
 private const val ASSISTANT_DIARY_MAX_ITEMS = 12
-private const val ASSISTANT_DIARY_WINDOW_MS = 12 * 60 * 60 * 1000L
+private const val ASSISTANT_DIARY_WINDOW_MS = 24 * 60 * 60 * 1000L
 private const val ASSISTANT_DIARY_REFRESH_MS = ASSISTANT_DIARY_WINDOW_MS
 private val ASSISTANT_DIARY_SCROLL_MAX_HEIGHT = 520.dp
 private const val EXECUTION_QUEUE_RENDER_MAX_ITEMS = 12
 private val EXECUTION_QUEUE_SCROLL_MAX_HEIGHT = 420.dp
+private const val ENGAGED_SESSION_RENDER_MAX_ITEMS = 10
 
 @Composable
 fun PermissionCommandCenterScreen(
@@ -158,6 +163,18 @@ fun PermissionCommandCenterScreen(
     var activeAudioClipPath by rememberSaveable { mutableStateOf("") }
     var audioReplayRunning by rememberSaveable { mutableStateOf(false) }
     var cloudTranscribeRunning by rememberSaveable { mutableStateOf(false) }
+    var engagedSessionRunning by rememberSaveable { mutableStateOf(false) }
+    var engagedSessionListening by rememberSaveable { mutableStateOf(false) }
+    var engagedSessionStopInFlight by rememberSaveable { mutableStateOf(false) }
+    var engagedSessionCloudTranscribing by rememberSaveable { mutableStateOf(false) }
+    var engagedSessionStatus by rememberSaveable { mutableStateOf("Tap Engage to start an engaged session.") }
+    var engagedSessionLatestSavedTranscript by rememberSaveable { mutableStateOf("") }
+    var engagedSessionStartedAt by rememberSaveable { mutableStateOf(0L) }
+    var engagedSessionLocaleTag by rememberSaveable { mutableStateOf(Locale.getDefault().toLanguageTag()) }
+    var engagedSessionToggleCooldownUntil by rememberSaveable { mutableStateOf(0L) }
+    var engagedSessionCurrentWavPath by rememberSaveable { mutableStateOf("") }
+    var engagedSessionCaptureJob by remember { mutableStateOf<Job?>(null) }
+    val engagedSessionStopSignal = remember { AtomicBoolean(false) }
     var assistantSessionGenerating by remember { mutableStateOf(false) }
     var manualSpeechIntakeRunning by rememberSaveable { mutableStateOf(false) }
     var manualSpeechHoldActive by rememberSaveable { mutableStateOf(false) }
@@ -171,7 +188,7 @@ fun PermissionCommandCenterScreen(
     var audioPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var dailyFocusGenerating by rememberSaveable { mutableStateOf(false) }
     var fourHourDiaryRows by remember { mutableStateOf(emptyList<FourHourDiaryRow>()) }
-    var fourHourDiaryStatus by remember { mutableStateOf("No 12-hour diary yet") }
+    var fourHourDiaryStatus by remember { mutableStateOf("No daily diary yet") }
     var fourHourDiaryRefreshing by remember { mutableStateOf(false) }
     var fourHourDiaryQueuedRefresh by remember { mutableStateOf(false) }
     var lastFourHourDiaryRefreshAt by remember { mutableStateOf(0L) }
@@ -246,6 +263,12 @@ fun PermissionCommandCenterScreen(
             manualSpeechHoldActive = false
             manualSpeechIntakeRunning = false
             manualSpeechIntakeJob?.cancel()
+            engagedSessionStopSignal.set(true)
+            engagedSessionCaptureJob?.cancel()
+            engagedSessionRunning = false
+            engagedSessionListening = false
+            engagedSessionStopInFlight = false
+            engagedSessionCloudTranscribing = false
             kotlin.runCatching { audioPlayer?.stop() }
             kotlin.runCatching { audioPlayer?.release() }
             audioPlayer = null
@@ -730,7 +753,7 @@ fun PermissionCommandCenterScreen(
         }
     }
 
-    fun refreshTwelveHourDiary(
+    fun refreshDailyDiary(
         force: Boolean = false,
         userInitiated: Boolean = false,
     ) {
@@ -744,12 +767,12 @@ fun PermissionCommandCenterScreen(
         val now = System.currentTimeMillis()
         if (!force && now - lastFourHourDiaryRefreshAt < ASSISTANT_DIARY_REFRESH_MS) return
         if (isGlobalLocked()) {
-            fourHourDiaryStatus = "Global lock enabled: 12-hour diary generation is blocked."
+            fourHourDiaryStatus = "Global lock enabled: daily diary generation is blocked."
             return
         }
 
         if (userInitiated) {
-            fourHourDiaryStatus = "Refreshing 12-hour diary..."
+            fourHourDiaryStatus = "Refreshing daily diary..."
         }
         fourHourDiaryRefreshing = true
         scope.launch(Dispatchers.IO) {
@@ -764,7 +787,7 @@ fun PermissionCommandCenterScreen(
                     runtimeConfig = state.localRuntimeConfig(),
                     onTrace = { trace, eventCount ->
                         persistModelTrace(
-                            trigger = "assistant_diary_12h",
+                            trigger = "assistant_diary_daily",
                             trace = trace,
                             contextEventCount = eventCount,
                         )
@@ -773,9 +796,9 @@ fun PermissionCommandCenterScreen(
                 withContext(Dispatchers.Main) {
                     fourHourDiaryRows = rows
                     fourHourDiaryStatus = if (rows.isEmpty()) {
-                        "No 12-hour diary windows yet. Keep collection running."
+                        "No daily diary rows yet. Keep collection running."
                     } else {
-                        "Showing latest ${rows.size} 12-hour diary windows (today-first)"
+                        "Showing latest ${rows.size} daily diary rows (newest-first)"
                     }
                     lastFourHourDiaryRefreshAt = System.currentTimeMillis()
                 }
@@ -791,7 +814,7 @@ fun PermissionCommandCenterScreen(
                 }
                 if (rerunQueued) {
                     withContext(Dispatchers.Main) {
-                        refreshTwelveHourDiary(force = true, userInitiated = false)
+                        refreshDailyDiary(force = true, userInitiated = false)
                     }
                 }
             }
@@ -873,7 +896,7 @@ fun PermissionCommandCenterScreen(
                                         }
                                         withContext(Dispatchers.Main) {
                                             state.refreshAssistantSessions()
-                                            refreshTwelveHourDiary(force = true)
+                                            refreshDailyDiary(force = true)
                                         }
                                     }
                                 }
@@ -899,7 +922,7 @@ fun PermissionCommandCenterScreen(
                                 }
                                 withContext(Dispatchers.Main) {
                                     state.refreshAssistantSessions()
-                                    refreshTwelveHourDiary(force = true)
+                                    refreshDailyDiary(force = true)
                                 }
                             }
                         }
@@ -925,10 +948,157 @@ fun PermissionCommandCenterScreen(
         }
     }
 
+    fun startEngagedSession() {
+        if (engagedSessionRunning || engagedSessionStopInFlight || engagedSessionCloudTranscribing) return
+        val now = System.currentTimeMillis()
+        if (now < engagedSessionToggleCooldownUntil) return
+        engagedSessionToggleCooldownUntil = now + 420L
+        if (isGlobalLocked()) {
+            markLockBlocked("engaged session")
+            engagedSessionStatus = "Global lock enabled: engaged session blocked."
+            return
+        }
+        val hasMicPermission =
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        if (!hasMicPermission) {
+            runtimePermissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+            engagedSessionStatus = "Microphone permission required. Enable RECORD_AUDIO first."
+            return
+        }
+        engagedSessionStartedAt = System.currentTimeMillis()
+        engagedSessionCurrentWavPath = ""
+        engagedSessionRunning = true
+        engagedSessionListening = true
+        engagedSessionStopInFlight = false
+        engagedSessionStatus = "Engaged recording started. Tap Engage again to stop and transcribe."
+        engagedSessionStopSignal.set(false)
+        engagedSessionCaptureJob?.cancel()
+        engagedSessionCaptureJob = scope.launch(Dispatchers.IO) {
+            val captureResult = state.captureManualSpeechIntakeContext(
+                shouldStop = { engagedSessionStopSignal.get() },
+            )
+            withContext(Dispatchers.Main) {
+                engagedSessionCaptureJob = null
+                engagedSessionRunning = false
+                engagedSessionListening = false
+                val wavPath = captureResult.wavPath.orEmpty().trim()
+                if (captureResult.status == "captured" && wavPath.isNotBlank()) {
+                    engagedSessionCurrentWavPath = wavPath
+                    engagedSessionCloudTranscribing = true
+                    engagedSessionStopInFlight = false
+                    engagedSessionStatus = "WAV saved. Uploading to GPT-4o-transcribe..."
+                    scope.launch(Dispatchers.IO) {
+                        val cloud = CloudSpeechTranscriptionRefiner.transcribeSingleClip(
+                            context = context.applicationContext,
+                            wavPath = wavPath,
+                            manualTrigger = true,
+                        )
+                        val persisted = if (cloud.status == "recognized" && cloud.transcript.isNotBlank()) {
+                            state.persistEngagedSession(
+                                sessionStartedAt = engagedSessionStartedAt,
+                                sessionEndedAt = System.currentTimeMillis(),
+                                transcript = cloud.transcript,
+                                localeTag = engagedSessionLocaleTag,
+                                segmentCount = 1,
+                                wavPath = wavPath,
+                                strategy = "engaged_gpt4o_transcribe",
+                            )
+                        } else {
+                            EngagedSessionPersistResult(
+                                status = cloud.status,
+                                transcript = "",
+                                detail = "Engaged session transcription ${cloud.status}: ${cloud.detail}",
+                            )
+                        }
+
+                        withContext(Dispatchers.Main) {
+                            engagedSessionCloudTranscribing = false
+                            engagedSessionStopInFlight = false
+                            engagedSessionStatus = persisted.detail
+                            if (persisted.transcript.isNotBlank()) {
+                                engagedSessionLatestSavedTranscript = persisted.transcript
+                            }
+                            state.refreshEngagedSessions()
+                            state.refreshContextTimeline()
+                            state.refreshAudioClips()
+                            state.refreshAssistantSessions()
+                            refreshDailyDiary(force = true)
+                        }
+                    }
+                    return@withContext
+                }
+
+                if (captureResult.status == "recognized" && captureResult.transcript.isNotBlank()) {
+                    scope.launch(Dispatchers.IO) {
+                        val persisted = state.persistEngagedSession(
+                            sessionStartedAt = engagedSessionStartedAt,
+                            sessionEndedAt = System.currentTimeMillis(),
+                            transcript = captureResult.transcript,
+                            localeTag = engagedSessionLocaleTag,
+                            segmentCount = 1,
+                            wavPath = wavPath.ifBlank { null },
+                            strategy = "engaged_local_transcribe_fallback",
+                        )
+                        withContext(Dispatchers.Main) {
+                            engagedSessionStatus = persisted.detail
+                            if (persisted.transcript.isNotBlank()) {
+                                engagedSessionLatestSavedTranscript = persisted.transcript
+                            }
+                            state.refreshEngagedSessions()
+                            state.refreshContextTimeline()
+                            state.refreshAudioClips()
+                            state.refreshAssistantSessions()
+                            refreshDailyDiary(force = true)
+                        }
+                    }
+                    return@withContext
+                }
+
+                engagedSessionStopInFlight = false
+                engagedSessionStatus = captureResult.detail
+                state.refreshAudioClips()
+            }
+        }
+    }
+
+    fun stopEngagedSession() {
+        if (!engagedSessionRunning || engagedSessionCloudTranscribing) return
+        val now = System.currentTimeMillis()
+        if (now < engagedSessionToggleCooldownUntil) return
+        engagedSessionToggleCooldownUntil = now + 420L
+        engagedSessionStopInFlight = true
+        engagedSessionListening = false
+        engagedSessionStatus = "Stopping recording... saving WAV."
+        engagedSessionStopSignal.set(true)
+        scope.launch {
+            delay(3_500L)
+            if (engagedSessionStopInFlight && engagedSessionRunning) {
+                engagedSessionCaptureJob?.cancel()
+                engagedSessionCaptureJob = null
+                engagedSessionRunning = false
+                engagedSessionStopInFlight = false
+                engagedSessionStatus = "Stop timeout: recording was cancelled. Tap Engage to retry."
+            }
+        }
+    }
+
+    fun toggleEngagedSession() {
+        if (engagedSessionCloudTranscribing) {
+            engagedSessionStatus = "Cloud transcription in progress. Please wait..."
+            return
+        }
+        if (engagedSessionRunning) {
+            stopEngagedSession()
+        } else {
+            startEngagedSession()
+        }
+    }
+
     LaunchedEffect(activeTab) {
         when (activeTab) {
             AppTab.CONTEXTS -> {
                 state.refreshAudioClips()
+                state.refreshEngagedSessions()
                 state.refreshContextLogs()
                 state.refreshContextTimeline()
                 if (
@@ -942,7 +1112,7 @@ fun PermissionCommandCenterScreen(
             AppTab.ASSISTANT -> {
                 state.refreshContextTimeline()
                 state.refreshAssistantSessions()
-                refreshTwelveHourDiary(force = false)
+                refreshDailyDiary(force = false)
                 if (
                     state.contextTimeline.isNotEmpty() &&
                     state.assistantBriefStatusMessage.startsWith("No proactive assistant brief")
@@ -970,7 +1140,7 @@ fun PermissionCommandCenterScreen(
         if (activeTab != AppTab.ASSISTANT) return@LaunchedEffect
         while (true) {
             delay(ASSISTANT_DIARY_REFRESH_MS)
-            refreshTwelveHourDiary(force = false)
+            refreshDailyDiary(force = false)
         }
     }
 
@@ -1210,6 +1380,13 @@ fun PermissionCommandCenterScreen(
                 }
 
                 item {
+                    EngagedSessionContextCard(
+                        state = state,
+                        onRefresh = { state.refreshEngagedSessions() },
+                    )
+                }
+
+                item {
                     ContextTimelineCard(
                         state = state,
                         onRefresh = { state.refreshContextTimeline() },
@@ -1223,6 +1400,7 @@ fun PermissionCommandCenterScreen(
                             state.refreshContextLogs()
                             state.refreshContextTimeline()
                             state.refreshAudioClips()
+                            state.refreshEngagedSessions()
                         },
                     )
                 }
@@ -1236,6 +1414,18 @@ fun PermissionCommandCenterScreen(
             }
 
             AppTab.ASSISTANT -> {
+                item {
+                    EngagedSessionControlCard(
+                        running = engagedSessionRunning,
+                        listening = engagedSessionListening,
+                        stopping = engagedSessionStopInFlight,
+                        transcribing = engagedSessionCloudTranscribing,
+                        status = engagedSessionStatus,
+                        latestTranscript = engagedSessionLatestSavedTranscript,
+                        onToggle = ::toggleEngagedSession,
+                    )
+                }
+
                 item {
                     ManualSpeechIntakeCard(
                         running = manualSpeechHoldActive,
@@ -1265,7 +1455,7 @@ fun PermissionCommandCenterScreen(
                     AssistantDiaryListCard(
                         rows = fourHourDiaryRows,
                         status = fourHourDiaryStatus,
-                        onRefresh = { refreshTwelveHourDiary(force = true, userInitiated = true) },
+                        onRefresh = { refreshDailyDiary(force = true, userInitiated = true) },
                     )
                 }
 
@@ -1740,6 +1930,116 @@ private fun AssistantSessionTableCard(
 }
 
 @Composable
+private fun EngagedSessionControlCard(
+    running: Boolean,
+    listening: Boolean,
+    stopping: Boolean,
+    transcribing: Boolean,
+    status: String,
+    latestTranscript: String,
+    onToggle: () -> Unit,
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "engagedSessionBreathing")
+    val breathingScale by infiniteTransition.animateFloat(
+        initialValue = 0.96f,
+        targetValue = 1.06f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 920, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "engagedSessionBreathingScale",
+    )
+    val targetScale = if (running) breathingScale else 1f
+    val buttonBg by animateColorAsState(
+        targetValue = if (running) Color(0xFF22C55E) else Color.White,
+        label = "engagedSessionButtonBg",
+    )
+    val buttonBorder by animateColorAsState(
+        targetValue = when {
+            running -> Color(0xFF16A34A)
+            else -> Color(0xFF0EA5E9)
+        },
+        label = "engagedSessionButtonBorder",
+    )
+    val buttonTextColor by animateColorAsState(
+        targetValue = if (running) Color.White else Color(0xFF0369A1),
+        label = "engagedSessionButtonTextColor",
+    )
+    val displayTranscript = latestTranscript.trim()
+
+    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Button(
+                onClick = onToggle,
+                enabled = !stopping && !transcribing,
+                shape = CircleShape,
+                contentPadding = PaddingValues(0.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = buttonBg,
+                    contentColor = buttonTextColor,
+                ),
+                modifier = Modifier
+                    .size(170.dp)
+                    .graphicsLayer {
+                        scaleX = targetScale
+                        scaleY = targetScale
+                    }
+                    .border(width = 3.dp, color = buttonBorder, shape = CircleShape),
+            ) {
+                Text(
+                    text = when {
+                        transcribing -> "TRANSCRIBING"
+                        stopping -> "STOPPING"
+                        running && listening -> "ENGAGED\nRECORDING"
+                        running -> "ENGAGED\nRECORDING"
+                        else -> "Engage"
+                    },
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+
+            Text(
+                text = status,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF475569),
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            if (displayTranscript.isNotBlank()) {
+                Text(
+                    text = "Latest Engaged Transcript",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF0F172A),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    text = displayTranscript,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF0F172A),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 160.dp)
+                        .verticalScroll(rememberScrollState())
+                        .background(
+                            color = Color(0xFFF8FAFC),
+                            shape = RoundedCornerShape(10.dp),
+                        )
+                        .padding(10.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun ManualSpeechIntakeCard(
     running: Boolean,
     status: String,
@@ -2208,7 +2508,7 @@ private fun AssistantDiaryListCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "12-Hour Assistant Diary",
+                    text = "Daily Assistant Diary",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                 )
@@ -2906,6 +3206,108 @@ private fun ConnectorRow(
                 } else {
                     Button(onClick = onAuthorize) {
                         Text("Connect")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EngagedSessionContextCard(
+    state: PermissionCommandCenterState,
+    onRefresh: () -> Unit,
+) {
+    val sessions = state.engagedSessions.take(ENGAGED_SESSION_RENDER_MAX_ITEMS)
+    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Engaged Sessions",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                OutlinedButton(onClick = onRefresh) {
+                    Text("Refresh")
+                }
+            }
+
+            Text(
+                text = state.engagedSessionStatusMessage,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF64748B),
+            )
+
+            if (state.engagedSessions.isEmpty()) {
+                Text(
+                    text = "No engaged sessions yet. Turn on Engage in Assistant to capture one.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF64748B),
+                )
+            } else {
+                Text(
+                    text = "Showing ${sessions.size} of ${state.engagedSessions.size} sessions (newest first).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF64748B),
+                )
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = CONTEXT_CARD_SCROLL_MAX_HEIGHT)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    sessions.forEach { item ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Text(
+                                    text = "${item.sessionLabel} | duration=${item.durationLabel}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF334155),
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    text = "${item.indoorOutdoor} | ${item.locationLabel}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF64748B),
+                                )
+                                Text(
+                                    text = item.transcript,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF0F172A),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(max = 140.dp)
+                                        .verticalScroll(rememberScrollState())
+                                        .background(
+                                            color = Color(0xFFFFFFFF),
+                                            shape = RoundedCornerShape(10.dp),
+                                        )
+                                        .padding(10.dp),
+                                )
+                                Text(
+                                    text = if (item.synced) "synced" else "pending_sync",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF64748B),
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -3783,26 +4185,23 @@ private fun buildFourHourDiaryRows(
     }
     if (contextOnly.isEmpty()) return emptyList()
 
-    val todayStart = startOfTodayMs()
-    val scoped = contextOnly.filter { it.occurredAt >= todayStart }.ifEmpty { contextOnly }
-
-    val windows = scoped
-        .groupBy { event -> (event.occurredAt / ASSISTANT_DIARY_WINDOW_MS) * ASSISTANT_DIARY_WINDOW_MS }
+    val windows = contextOnly
+        .groupBy { event -> startOfLocalDayMs(event.occurredAt) }
         .entries
         .sortedByDescending { it.key }
         .take(maxRows)
         .map { (startMs, groupedEvents) ->
             val ordered = groupedEvents.sortedByDescending { it.occurredAt }
-            val signal = selectDiarySignalEvents(ordered).ifEmpty { ordered.take(24) }
+            val signal = selectDiarySignalEvents(ordered).ifEmpty { ordered.take(96) }
             FourHourDiaryWindow(
                 startMs = startMs,
-                endMs = startMs + ASSISTANT_DIARY_WINDOW_MS,
+                endMs = endOfLocalDayExclusiveMs(startMs),
                 allEvents = ordered,
                 events = signal,
                 snapshot = buildSessionContextSnapshot(
                     context = context,
                     events = ordered,
-                    maxSpeechSegments = 36,
+                    maxSpeechSegments = 96,
                 ),
             )
         }
@@ -3812,7 +4211,7 @@ private fun buildFourHourDiaryRows(
             events = window.events,
             snapshot = window.snapshot,
         )
-        val windowLabel = formatSessionRange(window.startMs, window.endMs)
+        val windowLabel = formatDailyDiaryRange(window.startMs)
         val prompt = buildFourHourDiaryPrompt(
             windowLabel = windowLabel,
             snapshot = window.snapshot,
@@ -3849,13 +4248,13 @@ private fun buildFourHourDiaryPrompt(
     events: List<ContextEventPayload>,
     allEvents: List<ContextEventPayload>,
 ): String {
-    val speechEvidence = extractDiarySpeechEvidence(allEvents, maxItems = 36)
+    val speechEvidence = extractDiarySpeechEvidence(allEvents, maxItems = 256)
     val speechDigest = speechEvidence
         .asSequence()
         .map { sanitizeDiaryNarrativeLine(it) }
         .filter { it.isNotBlank() && !looksLikeTechnicalDiaryLine(it) }
         .distinctBy { it.lowercase(Locale.US) }
-        .take(32)
+        .take(128)
         .joinToString(separator = "\n") { "- $it" }
         .ifBlank { "- 无有效语音转录证据" }
 
@@ -3864,13 +4263,13 @@ private fun buildFourHourDiaryPrompt(
         .map { sanitizeDiaryNarrativeLine(it.summary) }
         .filter { it.isNotBlank() && !looksLikeTechnicalDiaryLine(it) }
         .distinctBy { it.lowercase(Locale.US) }
-        .take(24)
+        .take(64)
         .joinToString(separator = "\n") { "- $it" }
         .ifBlank { "- 暂无足够强的非技术事件证据" }
 
     return """
         你是运行在手机端的主动AI秘书。
-        请针对一个12小时窗口，写“发生了什么”的个人日记，不要写事件计数统计，不要写系统采集过程。
+        请针对一个自然日窗口（00:00-24:00），写“发生了什么”的个人日记，不要写事件计数统计，不要写系统采集过程。
         输出必须基于证据；如果不确定请明确说“证据不足/不确定”。
         语气要求：像写给用户自己的日记，具体自然、避免技术腔。
         长度要求：按证据丰富度动态调整。内容少就短写；内容丰富就写得更完整。
@@ -3892,7 +4291,7 @@ private fun buildFourHourDiaryPrompt(
         $eventsDigest
 
         严格按以下格式输出（纯文本）:
-        Diary Summary: <3-8句，像日记，描述这12小时具体发生了什么；有个人细节就保留>
+        Diary Summary: <6-16句，像日记，描述这一天具体发生了什么；有个人细节就保留>
         Proactive AI Can Help:
         - <我可以立刻帮你的事情1>
         - <我可以立刻帮你的事情2>
@@ -4091,12 +4490,20 @@ private fun extractDiarySpeechEvidence(
         .toList()
 }
 
-private fun startOfTodayMs(): Long {
+private fun startOfLocalDayMs(timestampMs: Long): Long {
     val calendar = Calendar.getInstance()
+    calendar.timeInMillis = timestampMs
     calendar.set(Calendar.HOUR_OF_DAY, 0)
     calendar.set(Calendar.MINUTE, 0)
     calendar.set(Calendar.SECOND, 0)
     calendar.set(Calendar.MILLISECOND, 0)
+    return calendar.timeInMillis
+}
+
+private fun endOfLocalDayExclusiveMs(startOfDayMs: Long): Long {
+    val calendar = Calendar.getInstance()
+    calendar.timeInMillis = startOfDayMs
+    calendar.add(Calendar.DAY_OF_YEAR, 1)
     return calendar.timeInMillis
 }
 
@@ -4112,7 +4519,7 @@ private fun buildFourHourSummary(
         locationLabel = snapshot.locationLabel,
         indoorOutdoor = snapshot.indoorOutdoor,
     )
-    val speechEvidence = extractDiarySpeechEvidence(events, maxItems = 10)
+    val speechEvidence = extractDiarySpeechEvidence(events, maxItems = 48)
         .asSequence()
         .map { sanitizeDiaryNarrativeLine(it) }
         .filter { it.isNotBlank() && !looksLikeTechnicalDiaryLine(it) && !isNonSpeechText(it) }
@@ -4136,11 +4543,11 @@ private fun buildFourHourSummary(
 
     val opening = when {
         !calendarDigest.isNullOrBlank() ->
-            "这12小时你主要在$locationDigest，围绕“$calendarDigest”推进事情，整体节奏比较明确。"
+            "这一天你主要在$locationDigest，围绕“$calendarDigest”推进事情，整体节奏比较明确。"
         speechEvidence.isNotEmpty() ->
-            "这12小时你主要在$locationDigest，很多注意力放在你口头提到的事项上，状态比较投入。"
+            "这一天你主要在$locationDigest，很多注意力放在你口头提到的事项上，状态比较投入。"
         else ->
-            "这12小时你主要在$locationDigest，整体在持续推进手头事项。"
+            "这一天你主要在$locationDigest，整体在持续推进手头事项。"
     }
 
     val moments = if (keyMoments.isEmpty()) {
@@ -4277,14 +4684,14 @@ private fun buildFourHourSelfTodo(
         todos += "移动中先做短任务，深度任务留到稳定场景。"
     }
     if (todos.isEmpty()) {
-        todos += "写下未来12小时最重要的一件事并设置提醒。"
+        todos += "写下今天剩余时间最重要的一件事并设置提醒。"
     }
     val result = todos.distinct().take(3).joinToString(" | ")
     return result.take(diaryActionCharLimit(result))
 }
 
 private fun diarySummaryCharLimit(text: String): Int {
-    if (text.isBlank()) return 520
+    if (text.isBlank()) return 1040
     val normalized = text.trim()
     val lower = normalized.lowercase(Locale.US)
     val punctuationCount = normalized.count { ch ->
@@ -4312,12 +4719,13 @@ private fun diarySummaryCharLimit(text: String): Int {
             "hotel",
         ),
     )
-    return when {
+    val baseLimit = when {
         hasQuote || hasPersonalDetail -> 920
         punctuationCount >= 6 || normalized.length > 640 -> 840
         punctuationCount >= 4 || normalized.length > 460 -> 720
         else -> 560
     }
+    return baseLimit * 2
 }
 
 private fun diaryActionCharLimit(text: String): Int {
@@ -4454,17 +4862,22 @@ private data class SpeechSignal(
 private fun extractSpeechSignal(event: ContextEventPayload): SpeechSignal? {
     val sourceLower = event.source.lowercase(Locale.US)
     val categoryLower = event.category.lowercase(Locale.US)
-    if (categoryLower != "audio" && !sourceLower.contains("audio")) return null
+    val isEngagedSession = categoryLower == "engaged_session" || sourceLower.contains("engaged_session")
+    if (categoryLower != "audio" && !sourceLower.contains("audio") && !isEngagedSession) return null
 
     val status = payloadString(event.payload, "status")?.lowercase(Locale.US).orEmpty()
     if (status == "no_speech" || status == "error") return null
 
     val stitched = payloadString(event.payload, "stitchedTranscript")
     val transcript = payloadString(event.payload, "transcript")
-    val summaryTranscript = if (event.summary.startsWith("Ambient speech transcript", ignoreCase = true)) {
-        event.summary.substringAfter(":", "").trim()
-    } else {
-        ""
+    val summaryTranscript = when {
+        event.summary.startsWith("Ambient speech transcript", ignoreCase = true) ->
+            event.summary.substringAfter(":", "").trim()
+        event.summary.startsWith("Manual intake speech", ignoreCase = true) ->
+            event.summary.substringAfter(":", "").trim()
+        event.summary.startsWith("Engaged session transcript", ignoreCase = true) ->
+            event.summary.substringAfter(":", "").trim()
+        else -> ""
     }
     val pickedText = listOf(stitched, transcript, summaryTranscript)
         .firstOrNull { !it.isNullOrBlank() }
@@ -4479,6 +4892,9 @@ private fun extractSpeechSignal(event: ContextEventPayload): SpeechSignal? {
 
     val clipKey = payloadString(event.payload, "wavPath")
         ?.ifBlank { null }
+        ?: payloadString(event.payload, "sessionStartedAt")
+            ?.ifBlank { null }
+            ?.let { "engaged:$it" }
         ?: payloadString(event.payload, "clipOccurredAt")
             ?.ifBlank { null }
             ?.let { "clipAt:$it" }
@@ -4808,6 +5224,12 @@ private fun formatSessionRange(startMs: Long, endMs: Long): String {
     val start = timeFmt.format(Date(startMs))
     val end = timeFmt.format(Date(endMs))
     return "$day $start-$end"
+}
+
+private fun formatDailyDiaryRange(startMs: Long): String {
+    val dayFmt = SimpleDateFormat("MM-dd", Locale.US)
+    val day = dayFmt.format(Date(startMs))
+    return "$day 00:00-24:00"
 }
 
 private fun reverseGeocodeLabel(

@@ -151,6 +151,22 @@ data class ManualSpeechIntakeResult(
     val detail: String,
 )
 
+data class EngagedSessionUiState(
+    val id: Long,
+    val sessionLabel: String,
+    val durationLabel: String,
+    val transcript: String,
+    val locationLabel: String,
+    val indoorOutdoor: String,
+    val synced: Boolean,
+)
+
+data class EngagedSessionPersistResult(
+    val status: String,
+    val transcript: String,
+    val detail: String,
+)
+
 data class AssistantSessionRowUiState(
     val sessionId: String,
     val sessionLabel: String,
@@ -259,6 +275,9 @@ class PermissionCommandCenterState internal constructor(
     private val _audioClips = mutableStateListOf<AudioClipDebugUiState>()
     val audioClips: List<AudioClipDebugUiState> get() = _audioClips
 
+    private val _engagedSessions = mutableStateListOf<EngagedSessionUiState>()
+    val engagedSessions: List<EngagedSessionUiState> get() = _engagedSessions
+
     private val _intentHints = mutableStateListOf<IntentHint>()
     val intentHints: List<IntentHint> get() = _intentHints
 
@@ -365,6 +384,9 @@ class PermissionCommandCenterState internal constructor(
         private set
 
     var audioClipStatusMessage by mutableStateOf("No audio clips captured yet")
+        private set
+
+    var engagedSessionStatusMessage by mutableStateOf("No engaged sessions yet")
         private set
 
     var contextInsightStatusMessage by mutableStateOf("No context insight yet")
@@ -841,6 +863,47 @@ class PermissionCommandCenterState internal constructor(
         }
     }
 
+    fun refreshEngagedSessions(limit: Int = 120) {
+        val rows = ContextEventStore.getInstance(appContext)
+            .getRecent(limit = 1200)
+            .filter { row ->
+                row.category.equals("engaged_session", ignoreCase = true) ||
+                    row.source.equals("assistant_engaged_session", ignoreCase = true)
+            }
+            .take(limit)
+
+        _engagedSessions.clear()
+        _engagedSessions.addAll(
+            rows.map { row ->
+                val payload = safePayloadMap(row.payloadJson)
+                val startedAt = valueAsLong(payload["sessionStartedAt"]) ?: row.occurredAt
+                val endedAt = valueAsLong(payload["sessionEndedAt"]) ?: row.occurredAt
+                val durationMs = valueAsLong(payload["durationMs"]) ?: (endedAt - startedAt).coerceAtLeast(0L)
+                val transcript = valueAsString(payload["transcript"]).orEmpty().ifBlank {
+                    row.summary.substringAfter(":", "").trim()
+                }
+                val locationLabel = valueAsString(payload["locationLabel"]).orEmpty().ifBlank { "Unknown location" }
+                val indoorOutdoor = valueAsString(payload["indoorOutdoor"]).orEmpty().ifBlank { "Unknown" }
+
+                EngagedSessionUiState(
+                    id = row.id,
+                    sessionLabel = "${formatTime(startedAt)} → ${formatTime(endedAt)}",
+                    durationLabel = formatDuration(durationMs),
+                    transcript = transcript,
+                    locationLabel = locationLabel,
+                    indoorOutdoor = indoorOutdoor,
+                    synced = row.synced,
+                )
+            }
+        )
+
+        engagedSessionStatusMessage = if (rows.isEmpty()) {
+            "No engaged sessions yet. Tap Engage in Assistant to start one."
+        } else {
+            "Showing latest ${rows.size} engaged sessions (newest first)"
+        }
+    }
+
     fun refreshModelInteractions(limit: Int = 120) {
         val rows = ContextEventStore.getInstance(appContext)
             .getRecent(limit = 800)
@@ -1035,6 +1098,101 @@ class PermissionCommandCenterState internal constructor(
                 append(", detail=${outcome.detail}")
             }
         }
+    }
+
+    fun persistEngagedSession(
+        sessionStartedAt: Long,
+        sessionEndedAt: Long,
+        transcript: String,
+        localeTag: String,
+        segmentCount: Int,
+        wavPath: String? = null,
+        strategy: String = "engaged_gpt4o_transcribe",
+    ): EngagedSessionPersistResult {
+        if (AppPrefs.isGlobalLockEnabled(appContext)) {
+            return EngagedSessionPersistResult(
+                status = "blocked",
+                transcript = "",
+                detail = "Global lock enabled: engaged session recording is blocked.",
+            )
+        }
+
+        val cleaned = normalizeEngagedTranscript(transcript)
+        if (cleaned.isBlank() || isNoSpeechText(cleaned)) {
+            return EngagedSessionPersistResult(
+                status = "no_speech",
+                transcript = "",
+                detail = "Engaged session stopped: no valid speech transcript captured.",
+            )
+        }
+
+        val startedAt = sessionStartedAt.takeIf { it > 0L } ?: System.currentTimeMillis()
+        val endedAt = sessionEndedAt.takeIf { it > startedAt } ?: System.currentTimeMillis()
+        val durationMs = (endedAt - startedAt).coerceAtLeast(0L)
+        val snapshot = buildManualSystemSnapshot()
+        val indoorOutdoor = inferIndoorOutdoor(
+            wifi = snapshot.wifi,
+            cellular = snapshot.cellular,
+        )
+        val stitched = cleaned.take(UI_MAX_STITCH_CHARS)
+
+        ContextEventStore.getInstance(appContext).insert(
+            ContextEvent(
+                eventId = java.util.UUID.randomUUID().toString(),
+                occurredAt = startedAt,
+                source = "assistant_engaged_session",
+                category = "engaged_session",
+                summary = "Engaged session transcript: $stitched",
+                payload = buildMap<String, Any> {
+                    put("status", "recognized")
+                    put("engagedSession", true)
+                    put("transcript", cleaned)
+                    put("stitchedTranscript", stitched)
+                    put("segmentCount", segmentCount.coerceAtLeast(1))
+                    put("sessionStartedAt", startedAt)
+                    put("sessionEndedAt", endedAt)
+                    put("durationMs", durationMs)
+                    put("locale", localeTag.ifBlank { Locale.getDefault().toLanguageTag() })
+                    put("strategy", strategy)
+                    put(
+                        "modelStatus",
+                        if (strategy.contains("gpt-4o-transcribe", ignoreCase = true)) {
+                            "cloud_refined"
+                        } else {
+                            "on_device_or_system"
+                        }
+                    )
+                    if (!wavPath.isNullOrBlank()) put("wavPath", wavPath)
+                    put("lightLux", snapshot.lightLux ?: -1.0)
+                    put("ambientState", snapshot.ambientState)
+                    put("activityState", snapshot.activityState)
+                    if (snapshot.wifi != null) put("wifi", snapshot.wifi)
+                    if (snapshot.cellular != null) put("cellular", snapshot.cellular)
+                    if (snapshot.internet != null) put("internet", snapshot.internet)
+                    if (snapshot.bluetoothEnabled != null) put("bluetoothEnabled", snapshot.bluetoothEnabled)
+                    if (!snapshot.wifiSsid.isNullOrBlank()) put("wifiSsid", snapshot.wifiSsid)
+                    put("indoorOutdoor", indoorOutdoor)
+                    put("locationLabel", snapshot.locationLabel)
+                    if (snapshot.latitude != null) put("latitude", snapshot.latitude)
+                    if (snapshot.longitude != null) put("longitude", snapshot.longitude)
+                    put("motionState", snapshot.motionState)
+                    put("transcriptionEventAt", System.currentTimeMillis())
+                },
+                sensitivity = Sensitivity.HIGH,
+                ttlSeconds = 14 * 24 * 3600,
+            )
+        )
+
+        return EngagedSessionPersistResult(
+            status = "recognized",
+            transcript = cleaned,
+            detail = buildString {
+                append("Engaged session saved")
+                append(" | duration=${formatDuration(durationMs)}")
+                append(" | location=${snapshot.locationLabel}")
+                append(" | indoor=${indoorOutdoor}")
+            },
+        )
     }
 
     suspend fun captureManualSpeechIntakeContext(
@@ -1442,7 +1600,8 @@ class PermissionCommandCenterState internal constructor(
     ): SessionSpeechSignal? {
         val sourceLower = row.source.lowercase(Locale.US)
         val categoryLower = row.category.lowercase(Locale.US)
-        if (categoryLower != "audio" && !sourceLower.contains("audio")) return null
+        val isEngagedSession = categoryLower == "engaged_session" || sourceLower.contains("engaged_session")
+        if (categoryLower != "audio" && !sourceLower.contains("audio") && !isEngagedSession) return null
 
         val status = valueAsString(payload["status"])?.lowercase(Locale.US).orEmpty()
         if (status == "no_speech" || status == "error") return null
@@ -1453,6 +1612,8 @@ class PermissionCommandCenterState internal constructor(
             row.summary.startsWith("Ambient speech transcript", ignoreCase = true) ->
                 row.summary.substringAfter(":", "").trim()
             row.summary.startsWith("Manual intake speech", ignoreCase = true) ->
+                row.summary.substringAfter(":", "").trim()
+            row.summary.startsWith("Engaged session transcript", ignoreCase = true) ->
                 row.summary.substringAfter(":", "").trim()
             else -> ""
         }
@@ -1468,6 +1629,7 @@ class PermissionCommandCenterState internal constructor(
             sourceLower.contains("refiner")
 
         val clipKey = valueAsString(payload["wavPath"])
+            ?: valueAsString(payload["sessionStartedAt"])?.let { "engaged:$it" }
             ?: valueAsString(payload["clipOccurredAt"])?.let { "clipAt:$it" }
             ?: "${row.occurredAt}:${pickedText.take(72).lowercase(Locale.US)}"
 
@@ -1534,6 +1696,13 @@ class PermissionCommandCenterState internal constructor(
             .trim()
             .replace("\u0000", "")
             .replace(Regex("\\s+"), " ")
+    }
+
+    private fun normalizeEngagedTranscript(raw: String): String {
+        return raw
+            .replace("\u0000", "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
     }
 
     fun enqueueAction(planId: String, step: ActionStepPayload): Long {
