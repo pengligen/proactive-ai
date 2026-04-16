@@ -48,6 +48,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
@@ -63,6 +64,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
@@ -70,7 +72,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -113,6 +118,21 @@ import com.proactiveai.extreme.storage.ContextEventStore
 import com.proactiveai.extreme.storage.toPayload
 import com.proactiveai.extreme.sync.SyncScheduler
 import com.proactiveai.extreme.ui.AppTab
+import com.proactiveai.extreme.ui.theme.Amber600
+import com.proactiveai.extreme.ui.theme.Emerald500
+import com.proactiveai.extreme.ui.theme.Emerald600
+import com.proactiveai.extreme.ui.theme.Gold200
+import com.proactiveai.extreme.ui.theme.Gold500
+import com.proactiveai.extreme.ui.theme.Rose600
+import com.proactiveai.extreme.ui.theme.Sky700
+import com.proactiveai.extreme.ui.theme.Slate100
+import com.proactiveai.extreme.ui.theme.Slate200
+import com.proactiveai.extreme.ui.theme.Slate50
+import com.proactiveai.extreme.ui.theme.Slate500
+import com.proactiveai.extreme.ui.theme.Slate600
+import com.proactiveai.extreme.ui.theme.Slate700
+import com.proactiveai.extreme.ui.theme.Slate800
+import com.proactiveai.extreme.ui.theme.Slate900
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -194,6 +214,7 @@ fun PermissionCommandCenterScreen(
     val manualSpeechHoldStopSignal = remember { AtomicBoolean(false) }
     var audioPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var dailyFocusGenerating by rememberSaveable { mutableStateOf(false) }
+    var manualSyncInFlight by rememberSaveable { mutableStateOf(false) }
     var fourHourDiaryRows by remember { mutableStateOf(emptyList<FourHourDiaryRow>()) }
     var fourHourDiaryStatus by remember { mutableStateOf("No daily diary yet") }
     var fourHourDiaryRefreshing by remember { mutableStateOf(false) }
@@ -242,6 +263,18 @@ fun PermissionCommandCenterScreen(
                 }
             }
         }
+    }
+
+    suspend fun awaitManualSyncResult(previousQueued: Int): Int {
+        var latest = previousQueued
+        repeat(8) {
+            delay(750)
+            latest = store.countUnsyncedMobileItems()
+            if (latest != previousQueued || latest == 0) {
+                return latest
+            }
+        }
+        return latest
     }
 
     val runtimePermissionLauncher = rememberLauncherForActivityResult(
@@ -1282,8 +1315,8 @@ fun PermissionCommandCenterScreen(
 
     LazyColumn(
         modifier = modifier
-            .background(Color(0xFFF5F7FA))
-            .padding(16.dp),
+            .background(MaterialTheme.colorScheme.background)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         when (activeTab) {
@@ -1313,17 +1346,46 @@ fun PermissionCommandCenterScreen(
                         onStartCollection = {
                             ProactiveCollectionService.start(context)
                             state.persistCollectionEnabled(true)
+                            state.setPlanPreview("Starting collection service. Android should keep an ongoing notification visible while foreground capture is active.")
                         },
                         onStopCollection = {
                             ProactiveCollectionService.stop(context)
                             state.persistCollectionEnabled(false)
+                            state.setPlanPreview("Stopping collection service. The ongoing notification should disappear once Android finishes shutting it down.")
                         },
-                        onSyncNow = { SyncScheduler.enqueueImmediate(context) },
+                        onSyncNow = {
+                            if (!manualSyncInFlight) {
+                                manualSyncInFlight = true
+                                val queuedBefore = state.unsyncedEvents
+                                state.setPlanPreview(
+                                    if (queuedBefore > 0) {
+                                        "Sync requested for $queuedBefore queued uploads..."
+                                    } else {
+                                        "Sync requested. Queue is already empty, checking backend..."
+                                    },
+                                )
+                                SyncScheduler.enqueueImmediate(context)
+                                scope.launch(Dispatchers.IO) {
+                                    val queuedAfter = awaitManualSyncResult(queuedBefore)
+                                    withContext(Dispatchers.Main) {
+                                        manualSyncInFlight = false
+                                        state.refreshGrantStates()
+                                        state.setPlanPreview(
+                                            manualSyncResultMessage(
+                                                queuedBefore = queuedBefore,
+                                                queuedAfter = queuedAfter,
+                                            ),
+                                        )
+                                    }
+                                }
+                            }
+                        },
                         onOpenSyncConfig = {
                             mobileSyncBaseUrl = state.mobileApiBaseUrl
                             showMobileSyncConfigDialog = true
                         },
                         onFetchPlan = ::fetchPlanWithEdgeInference,
+                        syncInFlight = manualSyncInFlight,
                     )
                 }
 
@@ -1585,128 +1647,132 @@ private fun SummaryCard(
     onSyncNow: () -> Unit,
     onOpenSyncConfig: () -> Unit,
     onFetchPlan: () -> Unit,
+    syncInFlight: Boolean = false,
 ) {
     val context = LocalContext.current
-    Card(
-        colors = CardDefaults.cardColors(
-            containerColor = Color(0xFF0F172A),
-            contentColor = Color.White,
+    val heroChrome = panelChrome(PanelTone.Hero)
+    val collectionServiceUi = collectionServiceStatusUi(state.collectionEnabled)
+    val manualSyncUi = manualSyncStatusUi(syncInFlight)
+    val primaryActions = listOf(
+        CompactActionButtonSpec(label = "Grant All Wizard", onClick = onGrantAll, outlined = false),
+        CompactActionButtonSpec(label = "Next Settings", onClick = onOpenNextSettings),
+    )
+    val secondaryActions = listOf(
+        CompactActionButtonSpec(label = "Ping Backend", onClick = onCheckBackend),
+        CompactActionButtonSpec(label = manualSyncUi.actionLabel, onClick = onSyncNow, enabled = manualSyncUi.actionEnabled),
+        CompactActionButtonSpec(label = "Sync Config", onClick = onOpenSyncConfig),
+        CompactActionButtonSpec(label = "Refresh Plan", onClick = onFetchPlan),
+    )
+    val serviceActions = listOf(
+        CompactActionButtonSpec(
+            label = collectionServiceUi.startActionLabel,
+            onClick = onStartCollection,
+            outlined = false,
+            enabled = collectionServiceUi.startActionEnabled,
+        ),
+        CompactActionButtonSpec(
+            label = collectionServiceUi.stopActionLabel,
+            onClick = onStopCollection,
+            enabled = collectionServiceUi.stopActionEnabled,
+        ),
+    )
+    CommandCenterPanel(tone = PanelTone.Hero) {
+        SectionEyebrow("Permissions & Sync", tone = PanelTone.Hero)
+        PanelHeader(
+            title = "Extreme Mode",
+            subtitle = "Readiness ${state.readinessScore}% with the core collection and sync controls.",
+            tone = PanelTone.Hero,
+            action = {
+                Switch(
+                    checked = state.masterEnabled,
+                    onCheckedChange = onToggleMaster,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Slate900,
+                        checkedTrackColor = Gold500,
+                        checkedBorderColor = Gold500,
+                        uncheckedThumbColor = Gold200,
+                        uncheckedTrackColor = Slate800,
+                        uncheckedBorderColor = Gold500.copy(alpha = 0.7f),
+                    ),
+                )
+            },
         )
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "Extreme Mode",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    Text(
-                        text = "Readiness: ${state.readinessScore}%",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                }
-                Switch(checked = state.masterEnabled, onCheckedChange = onToggleMaster)
-            }
 
+        SignalPillRow(
+            items = listOf(
+                "Plugins ${state.plugins.count { it.enabled }}/${state.plugins.size}" to SignalTone.Info,
+                "Collection ${collectionServiceUi.statusLabel}" to collectionServiceUi.statusTone,
+                "Backend ${state.orchestratorHealthLabel}" to when (state.orchestratorHealthLabel.lowercase(Locale.US)) {
+                    "healthy" -> SignalTone.Success
+                    "unknown" -> SignalTone.Neutral
+                    else -> SignalTone.Warning
+                },
+            ),
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            val lockOn = state.globalLockEnabled
             Text(
-                text = "Plugins: ${state.plugins.count { it.enabled }}/${state.plugins.size} | Service: ${if (state.collectionEnabled) "ON" else "OFF"}",
+                text = buildAnnotatedString {
+                    withStyle(style = SpanStyle(color = heroChrome.subtleColor)) {
+                        append("Global Lock: ")
+                    }
+                    withStyle(style = SpanStyle(color = if (lockOn) Rose600 else Emerald500)) {
+                        append(if (lockOn) "LOCKED" else "UNLOCKED")
+                    }
+                },
                 style = MaterialTheme.typography.bodyMedium,
             )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+            Button(
+                onClick = { onToggleGlobalLock(!lockOn) },
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Gold500,
+                    contentColor = Slate900,
+                ),
             ) {
-                val lockOn = state.globalLockEnabled
-                Text(
-                    text = "Global Lock: ${if (lockOn) "LOCKED" else "UNLOCKED"}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (lockOn) Color(0xFFFCA5A5) else Color(0xFF86EFAC),
-                )
-                Button(
-                    onClick = { onToggleGlobalLock(!lockOn) },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (lockOn) Color(0xFFB91C1C) else Color(0xFF15803D),
-                        contentColor = Color.White,
-                    ),
-                ) {
-                    Text(if (lockOn) "LOCK ON" else "LOCK OFF")
-                }
+                Text(if (lockOn) "LOCK ON" else "LOCK OFF")
             }
-            Text(
-                text = "Queued Uploads: ${state.unsyncedEvents}",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF94A3B8),
+        }
+
+        InfoSurface(tone = PanelTone.Hero) {
+            SignalValueRow(label = "Queued uploads", value = state.unsyncedEvents.toString(), toneContainer = PanelTone.Hero, tone = SignalTone.Info)
+            SignalValueRow(
+                label = "Collection service",
+                value = collectionServiceUi.statusLabel,
+                toneContainer = PanelTone.Hero,
+                tone = collectionServiceUi.statusTone,
             )
+            SignalValueRow(label = "Sync mode", value = "Base URL", toneContainer = PanelTone.Hero, tone = SignalTone.Success)
             Text(
                 text = "Mobile Sync API: ${MobileSyncConfig.baseUrl(context)}",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF94A3B8),
-            )
-            Text(
-                text = "Mobile Sync Mode: base-url only",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF15803D),
+                color = heroChrome.subtleColor,
             )
             Text(
                 text = "Legacy Orchestrator: ${OrchestratorConfig.baseUrl()}",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF94A3B8),
+                color = heroChrome.subtleColor,
             )
             Text(
-                text = "Backend Status: ${state.orchestratorHealthLabel}",
+                text = collectionServiceUi.detail,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF94A3B8),
+                color = if (state.collectionEnabled) Emerald500 else heroChrome.subtleColor,
             )
             Text(
                 text = state.lastPlanPreview,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF94A3B8),
+                color = heroChrome.subtleColor,
             )
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onGrantAll) {
-                    Text("Grant All Wizard")
-                }
-                OutlinedButton(onClick = onOpenNextSettings) {
-                    Text("Next Settings")
-                }
-            }
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onCheckBackend) {
-                    Text("Ping Backend")
-                }
-                OutlinedButton(onClick = onSyncNow) {
-                    Text("Sync Now")
-                }
-                OutlinedButton(onClick = onOpenSyncConfig) {
-                    Text("Sync Config")
-                }
-                OutlinedButton(onClick = onFetchPlan) {
-                    Text("Refresh Plan")
-                }
-            }
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onStartCollection) {
-                    Text("Start Service")
-                }
-                OutlinedButton(onClick = onStopCollection) {
-                    Text("Stop Service")
-                }
-            }
         }
+
+        CompactActionButtonGrid(actions = primaryActions, surfaceTone = ActionSurfaceTone.Dark)
+        CompactActionButtonGrid(actions = secondaryActions, surfaceTone = ActionSurfaceTone.Dark)
+        CompactActionButtonGrid(actions = serviceActions, surfaceTone = ActionSurfaceTone.Dark)
     }
 }
 
@@ -1725,92 +1791,62 @@ private fun ModelManagementCard(
         state.localModelPath4B
     }
 
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text(
-                text = "LiteRT-LM Model Management",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Text(
-                text = "Use local LiteRT-LM model, run inference tests, and review all prompt/response calls.",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
-            )
+    CommandCenterPanel {
+        SectionEyebrow("Models")
+        PanelHeader(
+            title = "LiteRT-LM Model Management",
+            subtitle = "Switch local models, inspect readiness, and review inference activity.",
+        )
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                state.edgeModelOptions.forEach { option ->
-                    val selected = option.id == state.edgeModelId
-                    if (selected) {
-                        Button(onClick = { onModelSelected(option.id) }) {
-                            Text(option.label)
-                        }
-                    } else {
-                        OutlinedButton(onClick = { onModelSelected(option.id) }) {
-                            Text(option.label)
-                        }
-                    }
-                }
-            }
+        CompactActionButtonGrid(
+            actions = state.edgeModelOptions.map { option ->
+                CompactActionButtonSpec(
+                    label = option.label,
+                    onClick = { onModelSelected(option.id) },
+                    outlined = option.id != state.edgeModelId,
+                )
+            },
+        )
 
+        SignalPillRow(
+            items = listOf(
+                LocalModelBackend.fromId(state.localModelBackendId).label to SignalTone.Info,
+                "Native ${if (state.localModelEnabled) "ON" else "OFF"}" to if (state.localModelEnabled) SignalTone.Success else SignalTone.Warning,
+                "Calls ${state.modelInteractions.size}" to SignalTone.Neutral,
+                "Cloud STT ${if (state.openAiApiKey.isBlank()) "missing" else "configured"}" to if (state.openAiApiKey.isBlank()) SignalTone.Warning else SignalTone.Success,
+            ),
+        )
+
+        InfoSurface {
             Text(
                 text = EdgeModelProfile.fromId(state.edgeModelId).description,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
-            )
-            Text(
-                text = "Native model: ${if (state.localModelEnabled) "ON" else "OFF"}",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
-            )
-            Text(
-                text = "Backend: ${LocalModelBackend.fromId(state.localModelBackendId).label}",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
                 text = "Active model file: ${activePath.ifBlank { "<unset>" }}",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
                 text = "Native status: ${state.latestNativeModelStatus}",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF334155),
+                color = if (state.latestNativeModelStatus.startsWith("Native model used")) Emerald600 else Amber600,
             )
             Text(
                 text = "Latest output: ${state.latestNativeModelOutput.ifBlank { "<empty>" }}",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF334155),
+                color = MaterialTheme.colorScheme.onSurface,
             )
-            Text(
-                text = "Logged local calls: ${state.modelInteractions.size}",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF334155),
-            )
-            Text(
-                text = "Cloud STT key: ${if (state.openAiApiKey.isBlank()) "missing" else "configured"}",
-                style = MaterialTheme.typography.bodySmall,
-                color = if (state.openAiApiKey.isBlank()) Color(0xFFB45309) else Color(0xFF15803D),
-            )
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onOpenInferenceTest) {
-                    Text("Inference Test")
-                }
-                OutlinedButton(onClick = onOpenModelConfig) {
-                    Text("Model Config")
-                }
-                OutlinedButton(onClick = onRefreshModelCalls) {
-                    Text("Refresh Calls")
-                }
-            }
         }
+
+        CompactActionButtonGrid(
+            actions = listOf(
+                CompactActionButtonSpec(label = "Inference Test", onClick = onOpenInferenceTest, outlined = false),
+                CompactActionButtonSpec(label = "Model Config", onClick = onOpenModelConfig),
+                CompactActionButtonSpec(label = "Refresh Calls", onClick = onRefreshModelCalls),
+            ),
+        )
     }
 }
 
@@ -1820,86 +1856,66 @@ private fun ModelInteractionJournalCard(
     onRefresh: () -> Unit,
 ) {
     val journalItems = state.modelInteractions.take(MODEL_JOURNAL_MAX_ITEMS)
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "Local Model Prompt/Response Journal",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
+    CommandCenterPanel {
+        PanelHeader(
+            title = "Local Model Prompt/Response Journal",
+            subtitle = "Review recent prompts, outputs, and trigger sources.",
+            action = {
                 OutlinedButton(onClick = onRefresh) {
                     Text("Refresh")
                 }
-            }
+            },
+        )
 
+        Text(
+            text = state.modelInteractionStatusMessage,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (state.modelInteractions.isEmpty()) {
             Text(
-                text = state.modelInteractionStatusMessage,
+                text = "No model call records yet. Run Inference Test or generate assistant/context insights.",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            Text(
+                text = "Showing ${journalItems.size} of ${state.modelInteractions.size} calls (newest first).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
-            if (state.modelInteractions.isEmpty()) {
-                Text(
-                    text = "No model call records yet. Run Inference Test or generate assistant/context insights.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
-                )
-            } else {
-                Text(
-                    text = "Showing ${journalItems.size} of ${state.modelInteractions.size} calls (newest first).",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
-                )
-
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = MODEL_JOURNAL_SCROLL_MAX_HEIGHT)
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    journalItems.forEach { item ->
-                        Card(
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(12.dp),
-                                verticalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                Text(
-                                    text = "${item.timestampLabel} | ${item.trigger} | ${item.modelLabel}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF334155),
-                                    fontWeight = FontWeight.Medium,
-                                )
-                                Text(
-                                    text = "Status: ${item.status}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF64748B),
-                                )
-                                Text(
-                                    text = "Prompt:\n${item.prompt.ifBlank { "<empty>" }}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF334155),
-                                )
-                                Text(
-                                    text = "Response:\n${item.response.ifBlank { "<empty>" }}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF334155),
-                                )
-                            }
-                        }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = MODEL_JOURNAL_SCROLL_MAX_HEIGHT)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                journalItems.forEach { item ->
+                    CommandCenterInsetPanel {
+                        Text(
+                            text = "${item.timestampLabel} | ${item.trigger} | ${item.modelLabel}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Slate700,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            text = "Status: ${item.status}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            text = "Prompt:\n${item.prompt.ifBlank { "<empty>" }}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Slate700,
+                        )
+                        Text(
+                            text = "Response:\n${item.response.ifBlank { "<empty>" }}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Slate700,
+                        )
                     }
                 }
             }
@@ -1938,14 +1954,14 @@ private fun AssistantSessionTableCard(
             Text(
                 text = state.assistantSessionStatusMessage,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
 
             if (state.assistantSessionRows.isEmpty()) {
                 Text(
                     text = "No session rows yet. Generate to analyze the latest 15-minute context windows.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF475569),
+                    color = Slate600,
                 )
             } else {
                 val scrollState = rememberScrollState()
@@ -1990,27 +2006,29 @@ private fun EngagedSessionControlCard(
     )
     val targetScale = if (running) breathingScale else 1f
     val buttonBg by animateColorAsState(
-        targetValue = if (running) Color(0xFF22C55E) else Color.White,
+        targetValue = if (running) Emerald500 else Color.White,
         label = "engagedSessionButtonBg",
     )
     val buttonBorder by animateColorAsState(
         targetValue = when {
-            running -> Color(0xFF16A34A)
-            else -> Color(0xFF0EA5E9)
+            running -> Emerald600
+            else -> Sky700
         },
         label = "engagedSessionButtonBorder",
     )
     val buttonTextColor by animateColorAsState(
-        targetValue = if (running) Color.White else Color(0xFF0369A1),
+        targetValue = if (running) Color.White else Sky700,
         label = "engagedSessionButtonTextColor",
     )
     val displayTranscript = latestTranscript.trim()
 
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+    CommandCenterPanel {
+        PanelHeader(
+            title = "Engaged Session",
+            subtitle = "Hands-free capture mode for continuous in-person context.",
+        )
         Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
+            modifier = Modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(14.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
@@ -2047,7 +2065,7 @@ private fun EngagedSessionControlCard(
             Text(
                 text = status,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF475569),
+                color = Slate600,
                 modifier = Modifier.fillMaxWidth(),
             )
 
@@ -2056,22 +2074,20 @@ private fun EngagedSessionControlCard(
                     text = "Latest Engaged Transcript",
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFF0F172A),
+                    color = Slate900,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Text(
                     text = displayTranscript,
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF0F172A),
+                    color = Slate900,
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(max = 160.dp)
                         .verticalScroll(rememberScrollState())
-                        .background(
-                            color = Color(0xFFF8FAFC),
-                            shape = RoundedCornerShape(10.dp),
-                        )
-                        .padding(10.dp),
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+                        .padding(12.dp),
                 )
             }
         }
@@ -2101,29 +2117,31 @@ private fun ManualSpeechIntakeCard(
     )
     val targetScale = if (running) breathingScale else 1f
     val buttonBg by animateColorAsState(
-        targetValue = if (running) Color(0xFF22C55E) else Color.White,
+        targetValue = if (running) Emerald500 else Color.White,
         label = "manualSpeechButtonBg",
     )
     val buttonBorder by animateColorAsState(
         targetValue = when {
-            running -> Color(0xFF16A34A)
-            else -> Color(0xFF0EA5E9)
+            running -> Emerald600
+            else -> Sky700
         },
         label = "manualSpeechButtonBorder",
     )
     val buttonTextColor by animateColorAsState(
         targetValue = when {
             running -> Color.White
-            else -> Color(0xFF0369A1)
+            else -> Sky700
         },
         label = "manualSpeechButtonTextColor",
     )
 
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+    CommandCenterPanel {
+        PanelHeader(
+            title = "Manual Speech Intake",
+            subtitle = "Press and hold to capture a focused voice note.",
+        )
         Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
+            modifier = Modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(14.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
@@ -2171,7 +2189,7 @@ private fun ManualSpeechIntakeCard(
             Text(
                 text = status,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF475569),
+                color = Slate600,
                 modifier = Modifier.fillMaxWidth(),
             )
             if (latestTranscript.isNotBlank()) {
@@ -2179,20 +2197,18 @@ private fun ManualSpeechIntakeCard(
                     text = "Latest Intake Transcript",
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFF0F172A),
+                    color = Slate900,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Text(
                     text = latestTranscript,
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF0F172A),
+                    color = Slate900,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(
-                            color = Color(0xFFF8FAFC),
-                            shape = RoundedCornerShape(10.dp),
-                        )
-                        .padding(10.dp),
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+                        .padding(12.dp),
                 )
             }
         }
@@ -2203,7 +2219,7 @@ private fun ManualSpeechIntakeCard(
 private fun SessionTableHeaderRow() {
     Row(
         modifier = Modifier
-            .background(Color(0xFFE2E8F0))
+            .background(Slate200)
             .padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -2253,7 +2269,7 @@ private fun SessionTableDataRow(
             )
             SessionTableCell(row.modelLabel, 170.dp)
         }
-        HorizontalDivider(color = Color(0xFFE2E8F0))
+        HorizontalDivider(color = Slate200)
     }
 }
 
@@ -2347,7 +2363,7 @@ private fun SessionTableCell(
                 .padding(horizontal = 8.dp, vertical = 4.dp)
                 .heightIn(min = 84.dp, max = scrollMaxHeight)
                 .background(
-                    color = Color(0xFFF8FAFC),
+                    color = Slate50,
                     shape = RoundedCornerShape(10.dp),
                 )
                 .padding(horizontal = 8.dp, vertical = 6.dp),
@@ -2359,7 +2375,7 @@ private fun SessionTableCell(
                     .verticalScroll(scrollState),
                 style = MaterialTheme.typography.bodySmall,
                 fontWeight = FontWeight.Normal,
-                color = Color(0xFF334155),
+                color = Slate700,
                 maxLines = Int.MAX_VALUE,
                 overflow = TextOverflow.Clip,
             )
@@ -2374,7 +2390,7 @@ private fun SessionTableCell(
             .padding(horizontal = 8.dp, vertical = 4.dp),
         style = MaterialTheme.typography.bodySmall,
         fontWeight = if (header) FontWeight.SemiBold else FontWeight.Normal,
-        color = if (header) Color(0xFF0F172A) else Color(0xFF334155),
+        color = if (header) Slate900 else Slate700,
         maxLines = if (header) 1 else maxLines,
         overflow = TextOverflow.Ellipsis,
     )
@@ -2471,7 +2487,7 @@ private fun InAppAiSearchDialog(
                         Text(
                             text = if (aiMode) "AI Mode Search (In-App)" else "In-App Preview",
                             style = MaterialTheme.typography.bodySmall,
-                            color = if (aiMode) Color(0xFF0F766E) else Color(0xFF64748B),
+                            color = if (aiMode) Sky700 else Slate500,
                         )
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -2487,7 +2503,7 @@ private fun InAppAiSearchDialog(
                 Text(
                     text = url,
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF475569),
+                    color = Slate600,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -2534,39 +2550,28 @@ private fun AssistantDiaryListCard(
     status: String,
     onRefresh: () -> Unit,
 ) {
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "Daily Assistant Diary",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
+    CommandCenterPanel {
+        PanelHeader(
+            title = "Daily Assistant Diary",
+            subtitle = "Four-hour windows with summaries, help opportunities, and self TODOs.",
+            action = {
                 OutlinedButton(onClick = onRefresh) {
                     Text("Refresh")
                 }
-            }
+            },
+        )
 
             Text(
                 text = status,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
 
             if (rows.isEmpty()) {
                 Text(
                     text = "No diary rows yet.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
             } else {
                 val xScrollState = rememberScrollState()
@@ -2581,7 +2586,8 @@ private fun AssistantDiaryListCard(
                 ) {
                     Row(
                         modifier = Modifier
-                            .background(Color(0xFFE2E8F0))
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
                             .padding(vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -2619,64 +2625,52 @@ private fun AssistantDiaryListCard(
                                 scrollMaxHeight = 220.dp,
                             )
                         }
-                        HorizontalDivider(color = Color(0xFFE2E8F0))
+                        HorizontalDivider(color = Slate200)
                     }
                 }
             }
         }
     }
-}
 
 @Composable
 private fun AssistantBriefCard(
     state: PermissionCommandCenterState,
     onGenerate: () -> Unit,
 ) {
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "Proactive Understanding Brief",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
+    CommandCenterPanel {
+        PanelHeader(
+            title = "Proactive Understanding Brief",
+            subtitle = "A compact synthesis of what the assistant thinks matters right now.",
+            action = {
                 Button(onClick = onGenerate) {
                     Text("Generate")
                 }
-            }
+            },
+        )
 
-            Text(
-                text = state.assistantBriefStatusMessage,
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
-            )
+        Text(
+            text = state.assistantBriefStatusMessage,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        InfoSurface {
             Text(
                 text = state.assistantBriefText,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF334155),
+                color = MaterialTheme.colorScheme.onSurface,
             )
-
             if (state.assistantHighlights.isNotEmpty()) {
                 Text(
                     text = "Potential help:",
                     style = MaterialTheme.typography.bodySmall,
                     fontWeight = FontWeight.Medium,
-                    color = Color(0xFF334155),
+                    color = MaterialTheme.colorScheme.onSurface,
                 )
                 state.assistantHighlights.forEach { highlight ->
                     Text(
                         text = "- $highlight",
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF475569),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
@@ -2714,36 +2708,31 @@ private fun ActionCenterCard(
             Text(
                 text = "On-device model",
                 style = MaterialTheme.typography.labelLarge,
-                color = Color(0xFF334155),
+                color = Slate700,
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                state.edgeModelOptions.forEach { option ->
-                    val selected = option.id == state.edgeModelId
-                    if (selected) {
-                        Button(onClick = { onModelSelected(option.id) }) {
-                            Text(option.label)
-                        }
-                    } else {
-                        OutlinedButton(onClick = { onModelSelected(option.id) }) {
-                            Text(option.label)
-                        }
-                    }
-                }
-            }
+            CompactActionButtonGrid(
+                actions = state.edgeModelOptions.map { option ->
+                    CompactActionButtonSpec(
+                        label = option.label,
+                        onClick = { onModelSelected(option.id) },
+                        outlined = option.id != state.edgeModelId,
+                    )
+                },
+            )
             Text(
                 text = EdgeModelProfile.fromId(state.edgeModelId).description,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
             Text(
                 text = "Native model: ${if (state.localModelEnabled) "ON" else "OFF"}",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
             Text(
                 text = "Backend: ${LocalModelBackend.fromId(state.localModelBackendId).label}",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
 
             Row(
@@ -2771,18 +2760,18 @@ private fun ActionCenterCard(
             Text(
                 text = "Strategy: ${state.latestInferenceStrategy}",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
             Text(
                 text = "Native status: ${state.latestNativeModelStatus}",
                 style = MaterialTheme.typography.bodySmall,
-                color = if (state.latestNativeModelStatus.startsWith("Native model used")) Color(0xFF15803D) else Color(0xFFB45309),
+                color = if (state.latestNativeModelStatus.startsWith("Native model used")) Emerald600 else Amber600,
             )
             Text(
                 text = "Model inference raw output:",
                 style = MaterialTheme.typography.bodySmall,
                 fontWeight = FontWeight.Medium,
-                color = Color(0xFF334155),
+                color = Slate700,
             )
             Text(
                 text = if (state.latestNativeModelOutput.isNotBlank()) {
@@ -2791,25 +2780,25 @@ private fun ActionCenterCard(
                     "<empty - check Native status above>"
                 },
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF334155),
+                color = Slate700,
             )
             Text(
                 text = "Heuristic summary:",
                 style = MaterialTheme.typography.bodySmall,
                 fontWeight = FontWeight.Medium,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
             Text(
                 text = state.latestInferenceSummary,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF334155),
+                color = Slate700,
             )
             if (state.intentHints.isNotEmpty()) {
                 state.intentHints.forEach { hint ->
                     Text(
                         text = "- ${hint.label} (${(hint.confidence * 100).toInt()}%): ${hint.reason}",
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF475569),
+                        color = Slate600,
                     )
                 }
             }
@@ -2818,7 +2807,7 @@ private fun ActionCenterCard(
                     Text(
                         text = "Suggested: $action",
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF475569),
+                        color = Slate600,
                     )
                 }
             }
@@ -2828,38 +2817,28 @@ private fun ActionCenterCard(
             Text(
                 text = "Intent Match ${state.metrics.intentMatchRate}% | Helpfulness ${state.metrics.actionHelpfulness}% | Interruption Quality ${state.metrics.interruptionQuality}%",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF334155),
+                color = Slate700,
             )
             Text(
                 text = "Suggestions ${state.metrics.suggestionsAccepted}/${state.metrics.suggestionsTotal}, Executions ${state.metrics.executionsSuccessful}/${state.metrics.executionsTotal}",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onGeneratePlan) {
-                    Text("Generate Plan")
-                }
-                OutlinedButton(onClick = onOpenInferenceTest) {
-                    Text("Inference Test")
-                }
-                OutlinedButton(onClick = onOpenModelConfig) {
-                    Text("Model Config")
-                }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onAutoExecute) {
-                    Text("Run Auto Steps")
-                }
-                OutlinedButton(onClick = onResetMetrics) {
-                    Text("Reset Metrics")
-                }
-            }
+            CompactActionButtonGrid(
+                actions = listOf(
+                    CompactActionButtonSpec(label = "Generate Plan", onClick = onGeneratePlan, outlined = false),
+                    CompactActionButtonSpec(label = "Inference Test", onClick = onOpenInferenceTest),
+                    CompactActionButtonSpec(label = "Model Config", onClick = onOpenModelConfig),
+                    CompactActionButtonSpec(label = "Run Auto Steps", onClick = onAutoExecute),
+                    CompactActionButtonSpec(label = "Reset Metrics", onClick = onResetMetrics),
+                ),
+            )
 
             Text(
                 text = state.latestExecutionLabel,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF334155),
+                color = Slate700,
             )
 
             val plan = state.currentPlan
@@ -2867,7 +2846,7 @@ private fun ActionCenterCard(
                 Text(
                     text = "No active plan. Generate a plan to start HITL and execution.",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
             } else {
                 HorizontalDivider()
@@ -2879,12 +2858,12 @@ private fun ActionCenterCard(
                 Text(
                     text = "Risk=${plan.riskLevel.name} | Confirmation=${plan.requiresUserConfirmation}",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF334155),
+                    color = Slate700,
                 )
                 Text(
                     text = plan.explainWhy,
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF334155),
+                    color = Slate700,
                 )
 
                 plan.steps.forEach { step ->
@@ -2923,7 +2902,7 @@ private fun InferenceTestDialog(
                 Text(
                     text = "输入一段你当前场景，端上策略会生成 synthetic context 并即时推理。",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
                 TextField(
                     value = value,
@@ -3010,12 +2989,12 @@ private fun LocalModelConfigDialog(
                 Text(
                     text = "Backend is fixed to LiteRT-LM in this build.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
                 Text(
                     text = "LiteRT-LM model paths (.litertlm):",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
                 TextField(
                     value = path2B,
@@ -3034,12 +3013,12 @@ private fun LocalModelConfigDialog(
                 Text(
                     text = "Example path: /data/user/0/com.proactiveai.extreme/files/models/gemma-4-E2B-it.litertlm",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
                 Text(
                     text = "Cloud STT (15-min refine via gpt-4o-transcribe):",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
                 TextField(
                     value = openAiApiKey,
@@ -3081,7 +3060,7 @@ private fun MobileSyncConfigDialog(
                 Text(
                     text = "本地填 ngrok 地址；线上填你自己的后端地址。现在只需要 base URL。",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
                 TextField(
                     value = baseUrl,
@@ -3093,7 +3072,7 @@ private fun MobileSyncConfigDialog(
                 Text(
                     text = "Device ID: $deviceId",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
             }
         },
@@ -3134,7 +3113,7 @@ private fun ActionStepCard(
 
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
+        colors = CardDefaults.cardColors(containerColor = Slate50),
     ) {
         Column(
             modifier = Modifier.padding(12.dp),
@@ -3148,13 +3127,13 @@ private fun ActionStepCard(
             Text(
                 text = "Policy: $modeLabel",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
             if (step.args.isNotEmpty()) {
                 Text(
                     text = "Args keys: ${step.args.keys.joinToString()}",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
             }
 
@@ -3162,7 +3141,7 @@ private fun ActionStepCard(
                 Text(
                     text = "Decision: ${if (decision) "Approved" else "Denied"}",
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (decision) Color(0xFF15803D) else Color(0xFFB91C1C),
+                    color = if (decision) Emerald600 else Rose600,
                 )
             }
 
@@ -3170,7 +3149,7 @@ private fun ActionStepCard(
                 Text(
                     text = executionResult,
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF334155),
+                    color = Slate700,
                 )
             }
 
@@ -3199,48 +3178,36 @@ private fun ConnectorCenterCard(
     onAuthorize: (String) -> Unit,
     onDisconnect: (String) -> Unit,
 ) {
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "Connector Center",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
+    CommandCenterPanel {
+        PanelHeader(
+            title = "Connector Center",
+            subtitle = "Connection health and account bindings for external services.",
+            action = {
                 OutlinedButton(onClick = onRefresh) {
                     Text("Refresh")
                 }
-            }
+            },
+        )
 
+        Text(
+            text = state.connectorStatusMessage,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (state.connectors.isEmpty()) {
             Text(
-                text = state.connectorStatusMessage,
+                text = "No connector status loaded yet.",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-
-            if (state.connectors.isEmpty()) {
-                Text(
-                    text = "No connector status loaded yet.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+        } else {
+            state.connectors.forEach { connector ->
+                ConnectorRow(
+                    connector = connector,
+                    onAuthorize = { onAuthorize(connector.id) },
+                    onDisconnect = { onDisconnect(connector.id) },
                 )
-            } else {
-                state.connectors.forEach { connector ->
-                    ConnectorRow(
-                        connector = connector,
-                        onAuthorize = { onAuthorize(connector.id) },
-                        onDisconnect = { onDisconnect(connector.id) },
-                    )
-                }
             }
         }
     }
@@ -3252,47 +3219,38 @@ private fun ConnectorRow(
     onAuthorize: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
-    ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
+    CommandCenterInsetPanel {
+        Text(
+            text = connector.title,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium,
+        )
+        SignalPill(
+            text = if (connector.connected) "Connected" else "Not connected",
+            tone = if (connector.connected) SignalTone.Success else SignalTone.Warning,
+        )
+        connector.accountLabel?.let {
             Text(
-                text = connector.title,
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.Medium,
-            )
-            Text(
-                text = if (connector.connected) "Connected" else "Not connected",
+                text = "Account: $it",
                 style = MaterialTheme.typography.bodySmall,
-                color = if (connector.connected) Color(0xFF15803D) else Color(0xFFB91C1C),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            connector.accountLabel?.let {
-                Text(
-                    text = "Account: $it",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
-                )
-            }
-            connector.lastConnectedLabel?.let {
-                Text(
-                    text = "Last connected: $it",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
-                )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (connector.connected) {
-                    OutlinedButton(onClick = onDisconnect) {
-                        Text("Disconnect")
-                    }
-                } else {
-                    Button(onClick = onAuthorize) {
-                        Text("Connect")
-                    }
+        }
+        connector.lastConnectedLabel?.let {
+            Text(
+                text = "Last connected: $it",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (connector.connected) {
+                OutlinedButton(onClick = onDisconnect) {
+                    Text("Disconnect")
+                }
+            } else {
+                Button(onClick = onAuthorize) {
+                    Text("Connect")
                 }
             }
         }
@@ -3305,95 +3263,72 @@ private fun EngagedSessionContextCard(
     onRefresh: () -> Unit,
 ) {
     val sessions = state.engagedSessions.take(ENGAGED_SESSION_RENDER_MAX_ITEMS)
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "Engaged Sessions",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
+    CommandCenterPanel {
+        PanelHeader(
+            title = "Engaged Sessions",
+            subtitle = "Recent long-form captures with location and sync state.",
+            action = {
                 OutlinedButton(onClick = onRefresh) {
                     Text("Refresh")
                 }
-            }
+            },
+        )
 
+        Text(
+            text = state.engagedSessionStatusMessage,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (state.engagedSessions.isEmpty()) {
             Text(
-                text = state.engagedSessionStatusMessage,
+                text = "No engaged sessions yet. Turn on Engage in Assistant to capture one.",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            Text(
+                text = "Showing ${sessions.size} of ${state.engagedSessions.size} sessions (newest first).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
-            if (state.engagedSessions.isEmpty()) {
-                Text(
-                    text = "No engaged sessions yet. Turn on Engage in Assistant to capture one.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
-                )
-            } else {
-                Text(
-                    text = "Showing ${sessions.size} of ${state.engagedSessions.size} sessions (newest first).",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
-                )
-
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = CONTEXT_CARD_SCROLL_MAX_HEIGHT)
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    sessions.forEach { item ->
-                        Card(
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(12.dp),
-                                verticalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                Text(
-                                    text = "${item.sessionLabel} | duration=${item.durationLabel}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF334155),
-                                    fontWeight = FontWeight.Medium,
-                                )
-                                Text(
-                                    text = "${item.indoorOutdoor} | ${item.locationLabel}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF64748B),
-                                )
-                                Text(
-                                    text = item.transcript,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF0F172A),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .heightIn(max = 140.dp)
-                                        .verticalScroll(rememberScrollState())
-                                        .background(
-                                            color = Color(0xFFFFFFFF),
-                                            shape = RoundedCornerShape(10.dp),
-                                        )
-                                        .padding(10.dp),
-                                )
-                                Text(
-                                    text = if (item.synced) "synced" else "pending_sync",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF64748B),
-                                )
-                            }
-                        }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = CONTEXT_CARD_SCROLL_MAX_HEIGHT)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                sessions.forEach { item ->
+                    CommandCenterInsetPanel {
+                        Text(
+                            text = "${item.sessionLabel} | duration=${item.durationLabel}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Slate700,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            text = "${item.indoorOutdoor} | ${item.locationLabel}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            text = item.transcript,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Slate900,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 140.dp)
+                                .verticalScroll(rememberScrollState())
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(color = MaterialTheme.colorScheme.surface)
+                                .padding(10.dp),
+                        )
+                        SignalPill(
+                            text = if (item.synced) "synced" else "pending_sync",
+                            tone = if (item.synced) SignalTone.Success else SignalTone.Warning,
+                        )
                     }
                 }
             }
@@ -3432,20 +3367,20 @@ private fun ContextTimelineCard(
             Text(
                 text = state.contextTimelineStatusMessage,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
 
             if (state.contextTimeline.isEmpty()) {
                 Text(
                     text = "No context events captured yet.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
             } else {
                 Text(
                     text = "Showing ${timelineItems.size} of ${state.contextTimeline.size} events (newest first).",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
 
                 Column(
@@ -3458,7 +3393,7 @@ private fun ContextTimelineCard(
                     timelineItems.forEach { item ->
                         Card(
                             modifier = Modifier.fillMaxWidth(),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
+                            colors = CardDefaults.cardColors(containerColor = Slate50),
                         ) {
                             Column(
                                 modifier = Modifier.padding(12.dp),
@@ -3467,18 +3402,18 @@ private fun ContextTimelineCard(
                                 Text(
                                     text = "${item.timestampLabel} | ${item.source}.${item.category}",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF334155),
+                                    color = Slate700,
                                     fontWeight = FontWeight.Medium,
                                 )
                                 Text(
                                     text = item.summary,
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF475569),
+                                    color = Slate600,
                                 )
                                 Text(
                                     text = "sensitivity=${item.sensitivity} | ${if (item.synced) "synced" else "pending_sync"}",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF64748B),
+                                    color = Slate500,
                                 )
                             }
                         }
@@ -3519,12 +3454,12 @@ private fun ContextInsightCard(
             Text(
                 text = state.contextInsightStatusMessage,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
             Text(
                 text = state.contextInsightSummary,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF334155),
+                color = Slate700,
             )
 
             if (state.contextInsightActions.isNotEmpty()) {
@@ -3532,13 +3467,13 @@ private fun ContextInsightCard(
                     text = "Potential actions:",
                     style = MaterialTheme.typography.bodySmall,
                     fontWeight = FontWeight.Medium,
-                    color = Color(0xFF334155),
+                    color = Slate700,
                 )
                 state.contextInsightActions.forEach { action ->
                     Text(
                         text = "- $action",
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF475569),
+                        color = Slate600,
                     )
                 }
             }
@@ -3560,159 +3495,130 @@ private fun AudioClipDebugCard(
     onPlayOrStop: (String) -> Unit,
 ) {
     val clipItems = state.audioClips.take(CONTEXT_CARD_MAX_ITEMS)
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "Audio Clips Debug",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = onRefresh) {
-                        Text("Refresh")
-                    }
-                    OutlinedButton(
-                        onClick = onReplayLatest,
-                        enabled = !replayRunning,
-                    ) {
-                        Text(if (replayRunning) "Re-run..." else "Re-run STT")
-                    }
-                    OutlinedButton(onClick = onClear) {
-                        Text("Clear")
-                    }
-                }
-            }
+    CommandCenterPanel {
+        PanelHeader(
+            title = "Audio Clips Debug",
+            subtitle = "Recent captured clips, transcription attempts, and replay controls.",
+        )
+        CompactActionButtonGrid(
+            actions = listOf(
+                CompactActionButtonSpec(label = "Refresh", onClick = onRefresh),
+                CompactActionButtonSpec(
+                    label = if (replayRunning) "Re-run..." else "Re-run STT",
+                    onClick = onReplayLatest,
+                    enabled = !replayRunning,
+                ),
+                CompactActionButtonSpec(label = "Clear", onClick = onClear),
+            ),
+        )
 
+        Text(
+            text = state.audioClipStatusMessage,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (state.audioClips.isEmpty()) {
             Text(
-                text = state.audioClipStatusMessage,
+                text = "No wav clips yet. Keep service on and speak near the device.",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            Text(
+                text = "Showing ${clipItems.size} of ${state.audioClips.size} clips (newest first).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
-            if (state.audioClips.isEmpty()) {
-                Text(
-                    text = "No wav clips yet. Keep service on and speak near the device.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
-                )
-            } else {
-                Text(
-                    text = "Showing ${clipItems.size} of ${state.audioClips.size} clips (newest first).",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
-                )
-
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = CONTEXT_CARD_SCROLL_MAX_HEIGHT)
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    clipItems.forEach { clip ->
-                        Card(
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(12.dp),
-                                verticalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                Text(
-                                    text = "${clip.capturedAtLabel} | ${clip.fileName}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF334155),
-                                    fontWeight = FontWeight.Medium,
-                                )
-                                Text(
-                                    text = "status=${clip.status} | strategy=${clip.strategy} | duration=${clip.durationLabel} | size=${clip.sizeLabel}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF64748B),
-                                )
-                                if (clip.reason.isNotBlank()) {
-                                    Text(
-                                        text = "reason: ${clip.reason}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color(0xFF64748B),
-                                    )
-                                }
-                                if (clip.modelStatus.isNotBlank()) {
-                                    Text(
-                                        text = "detail: ${clip.modelStatus}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color(0xFF64748B),
-                                    )
-                                }
-                                if (clip.transcript.isNotBlank()) {
-                                    Text(
-                                        text = "transcript: ${clip.transcript}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color(0xFF334155),
-                                    )
-                                }
-                                if (clip.stitchedTranscript.isNotBlank()) {
-                                    Text(
-                                        text = "full sentence: ${clip.stitchedTranscript}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color(0xFF0F766E),
-                                    )
-                                }
-                                if (clip.refinedStatus.isNotBlank()) {
-                                    Text(
-                                        text = "cloud refine status: ${clip.refinedStatus}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = if (clip.refinedStatus == "recognized") Color(0xFF15803D) else Color(0xFFB45309),
-                                    )
-                                }
-                                if (clip.refinedTranscript.isNotBlank()) {
-                                    Text(
-                                        text = "cloud transcript: ${clip.refinedTranscript}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color(0xFF1D4ED8),
-                                    )
-                                }
-                                Text(
-                                    text = clip.filePath,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF475569),
-                                )
-
-                                val isPlaying = activeClipPath == clip.filePath
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    if (isPlaying) {
-                                        OutlinedButton(onClick = { onPlayOrStop(clip.filePath) }) {
-                                            Text("Stop")
-                                        }
-                                    } else {
-                                        Button(onClick = { onPlayOrStop(clip.filePath) }) {
-                                            Text("Play")
-                                        }
-                                    }
-                                    OutlinedButton(
-                                        onClick = { onReplaySingle(clip.filePath) },
-                                        enabled = !replayRunning,
-                                    ) {
-                                        Text("Re-run")
-                                    }
-                                    OutlinedButton(
-                                        onClick = { onCloudTranscribeSingle(clip.filePath) },
-                                        enabled = !cloudTranscribeRunning,
-                                    ) {
-                                        Text(if (cloudTranscribeRunning) "GPT..." else "GPT Transcribe")
-                                    }
-                                }
-                            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = CONTEXT_CARD_SCROLL_MAX_HEIGHT)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                clipItems.forEach { clip ->
+                    CommandCenterInsetPanel {
+                        Text(
+                            text = "${clip.capturedAtLabel} | ${clip.fileName}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Slate700,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            text = "status=${clip.status} | strategy=${clip.strategy} | duration=${clip.durationLabel} | size=${clip.sizeLabel}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        if (clip.reason.isNotBlank()) {
+                            Text(
+                                text = "reason: ${clip.reason}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
+                        if (clip.modelStatus.isNotBlank()) {
+                            Text(
+                                text = "detail: ${clip.modelStatus}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (clip.transcript.isNotBlank()) {
+                            Text(
+                                text = "transcript: ${clip.transcript}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Slate700,
+                            )
+                        }
+                        if (clip.stitchedTranscript.isNotBlank()) {
+                            Text(
+                                text = "full sentence: ${clip.stitchedTranscript}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Sky700,
+                            )
+                        }
+                        if (clip.refinedStatus.isNotBlank()) {
+                            Text(
+                                text = "cloud refine status: ${clip.refinedStatus}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (clip.refinedStatus == "recognized") Emerald600 else Amber600,
+                            )
+                        }
+                        if (clip.refinedTranscript.isNotBlank()) {
+                            Text(
+                                text = "cloud transcript: ${clip.refinedTranscript}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Sky700,
+                            )
+                        }
+                        Text(
+                            text = clip.filePath,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Slate600,
+                        )
+
+                        val isPlaying = activeClipPath == clip.filePath
+                        CompactActionButtonGrid(
+                            actions = listOf(
+                                CompactActionButtonSpec(
+                                    label = if (isPlaying) "Stop" else "Play",
+                                    onClick = { onPlayOrStop(clip.filePath) },
+                                    outlined = isPlaying,
+                                ),
+                                CompactActionButtonSpec(
+                                    label = "Re-run",
+                                    onClick = { onReplaySingle(clip.filePath) },
+                                    enabled = !replayRunning,
+                                ),
+                                CompactActionButtonSpec(
+                                    label = if (cloudTranscribeRunning) "GPT..." else "GPT Transcribe",
+                                    onClick = { onCloudTranscribeSingle(clip.filePath) },
+                                    enabled = !cloudTranscribeRunning,
+                                ),
+                            ),
+                        )
                     }
                 }
             }
@@ -3750,20 +3656,20 @@ private fun ContextLogCard(
             Text(
                 text = state.contextLogStatusMessage,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
 
             if (state.contextLogs.isEmpty()) {
                 Text(
                     text = "No logs yet. Keep collection service ON for 1+ minute.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate500,
                 )
             } else {
                 state.contextLogs.forEach { log ->
                     Card(
                         modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
+                        colors = CardDefaults.cardColors(containerColor = Slate50),
                     ) {
                         Column(
                             modifier = Modifier.padding(12.dp),
@@ -3772,12 +3678,12 @@ private fun ContextLogCard(
                             Text(
                                 text = "${log.timestampLabel} | ${if (log.synced) "synced" else "pending_sync"}",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF64748B),
+                                color = Slate500,
                             )
                             Text(
                                 text = log.summary,
                                 style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF334155),
+                                color = Slate700,
                             )
                         }
                     }
@@ -3794,64 +3700,50 @@ private fun ActionHistoryCard(
     onCycleFilter: () -> Unit,
     onExport: () -> Unit,
 ) {
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "Action History",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
+    CommandCenterPanel {
+        PanelHeader(
+            title = "Action History",
+            subtitle = "Recent assistant decisions, exports, and execution notes.",
+            action = {
                 OutlinedButton(onClick = onClear) {
                     Text("Clear")
                 }
-            }
+            },
+        )
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onCycleFilter) {
-                    Text("Filter: ${state.historyFilter.label}")
-                }
-                OutlinedButton(onClick = onExport) {
-                    Text("Export")
-                }
-            }
+        CompactActionButtonGrid(
+            actions = listOf(
+                CompactActionButtonSpec(label = "Filter: ${state.historyFilter.label}", onClick = onCycleFilter),
+                CompactActionButtonSpec(label = "Export", onClick = onExport),
+            ),
+        )
+        Text(
+            text = state.historyExportLabel,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (state.actionHistory.isEmpty()) {
             Text(
-                text = state.historyExportLabel,
+                text = "No action history yet.",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-
-            if (state.actionHistory.isEmpty()) {
+        } else {
+            state.actionHistory.forEach { item ->
                 Text(
-                    text = "No action history yet.",
+                    text = "${item.timestampLabel} | ${item.eventType} | ${item.summary}",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = Slate700,
                 )
-            } else {
-                state.actionHistory.forEach { item ->
+                if (!item.detail.isNullOrBlank()) {
                     Text(
-                        text = "${item.timestampLabel} | ${item.eventType} | ${item.summary}",
+                        text = item.detail,
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF334155),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    if (!item.detail.isNullOrBlank()) {
-                        Text(
-                            text = item.detail,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFF64748B),
-                        )
-                    }
-                    HorizontalDivider()
                 }
+                HorizontalDivider()
             }
         }
     }
@@ -3867,117 +3759,94 @@ private fun ExecutionQueueCard(
     onRetry: (Long) -> Unit,
     onClearSucceeded: () -> Unit,
 ) {
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "Execution Queue",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
+    CommandCenterPanel {
+        PanelHeader(
+            title = "Execution Queue",
+            subtitle = "Queued assistant work and retries, optimized for narrow mobile screens.",
+            action = {
                 OutlinedButton(onClick = onRefresh) {
                     Text("Refresh")
                 }
-            }
+            },
+        )
 
-            Text(
-                text = state.queueStatusMessage,
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
-            )
+        Text(
+            text = state.queueStatusMessage,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onRunNow) {
-                    Text("Run Now")
-                }
-                OutlinedButton(
+        CompactActionButtonGrid(
+            actions = listOf(
+                CompactActionButtonSpec(label = "Run Now", onClick = onRunNow),
+                CompactActionButtonSpec(
+                    label = if (generatingDailyFocus) "Generating..." else "Generate Focus Top3",
                     onClick = onGenerateDailyFocus,
                     enabled = !generatingDailyFocus,
-                ) {
-                    Text(if (generatingDailyFocus) "Generating..." else "Generate Focus Top3")
-                }
-                OutlinedButton(onClick = onClearSucceeded) {
-                    Text("Clear Done")
-                }
-            }
+                ),
+                CompactActionButtonSpec(label = "Clear Done", onClick = onClearSucceeded),
+            ),
+        )
 
-            if (state.executionQueue.isEmpty()) {
+        if (state.executionQueue.isEmpty()) {
+            Text(
+                text = "No queued action.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            val visibleQueueItems = state.executionQueue.take(EXECUTION_QUEUE_RENDER_MAX_ITEMS)
+            if (state.executionQueue.size > visibleQueueItems.size) {
                 Text(
-                    text = "No queued action.",
+                    text = "Showing latest ${visibleQueueItems.size} / ${state.executionQueue.size} items",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF64748B),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-            } else {
-                val visibleQueueItems = state.executionQueue.take(EXECUTION_QUEUE_RENDER_MAX_ITEMS)
-                if (state.executionQueue.size > visibleQueueItems.size) {
-                    Text(
-                        text = "Showing latest ${visibleQueueItems.size} / ${state.executionQueue.size} items",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF64748B),
-                    )
-                }
-                val queueScrollState = rememberScrollState()
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = EXECUTION_QUEUE_SCROLL_MAX_HEIGHT)
-                        .verticalScroll(queueScrollState),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    visibleQueueItems.forEach { item ->
-                        Card(
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC)),
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(12.dp),
-                                verticalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                Text(
-                                    text = item.summary,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.Medium,
-                                )
-                                item.detail?.let { detail ->
-                                    Text(
-                                        text = detail,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color(0xFF334155),
-                                    )
-                                }
-                                Text(
-                                    text = "Status=${item.status} Attempts=${item.attempts} Updated=${item.updatedAtLabel}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF64748B),
-                                )
-                                item.nextRetryLabel?.let {
-                                    Text(
-                                        text = "Next retry: $it",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color(0xFF64748B),
-                                    )
-                                }
-                                item.lastError?.let {
-                                    Text(
-                                        text = "Error: $it",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color(0xFFB91C1C),
-                                    )
-                                }
-                                if (item.status == "FAILED") {
-                                    OutlinedButton(onClick = { onRetry(item.id) }) {
-                                        Text("Retry")
-                                    }
-                                }
+            }
+            val queueScrollState = rememberScrollState()
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = EXECUTION_QUEUE_SCROLL_MAX_HEIGHT)
+                    .verticalScroll(queueScrollState),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                visibleQueueItems.forEach { item ->
+                    CommandCenterInsetPanel {
+                        Text(
+                            text = item.summary,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        item.detail?.let { detail ->
+                            Text(
+                                text = detail,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Slate700,
+                            )
+                        }
+                        Text(
+                            text = "Status=${item.status} Attempts=${item.attempts} Updated=${item.updatedAtLabel}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        item.nextRetryLabel?.let {
+                            Text(
+                                text = "Next retry: $it",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        item.lastError?.let {
+                            Text(
+                                text = "Error: $it",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Rose600,
+                            )
+                        }
+                        if (item.status == "FAILED") {
+                            OutlinedButton(onClick = { onRetry(item.id) }) {
+                                Text("Retry")
                             }
                         }
                     }
@@ -4015,7 +3884,7 @@ private fun PluginCard(
                     Text(
                         text = "Risk: ${plugin.riskLabel}",
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFFB45309),
+                        color = Amber600,
                     )
                 }
                 Switch(checked = plugin.enabled, onCheckedChange = onTogglePlugin)
@@ -4024,7 +3893,7 @@ private fun PluginCard(
             Text(
                 text = plugin.description,
                 style = MaterialTheme.typography.bodyMedium,
-                color = Color(0xFF334155),
+                color = Slate700,
             )
 
             HorizontalDivider()
@@ -4062,12 +3931,12 @@ private fun PermissionRow(
             Text(
                 text = "Gate=${permission.gate} | TTL=${permission.ttlHours}h",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
             Text(
                 text = permission.purpose,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF64748B),
+                color = Slate500,
             )
         }
 
@@ -4075,7 +3944,7 @@ private fun PermissionRow(
             Text(
                 text = if (permission.granted) "GRANTED" else "PENDING",
                 style = MaterialTheme.typography.labelMedium,
-                color = if (permission.granted) Color(0xFF15803D) else Color(0xFFB91C1C),
+                color = if (permission.granted) Emerald600 else Amber600,
             )
 
             val needsSettingsResolution =
