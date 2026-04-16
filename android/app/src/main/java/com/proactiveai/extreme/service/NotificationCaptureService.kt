@@ -52,7 +52,9 @@ class NotificationCaptureService : NotificationListenerService() {
             ttlSeconds = 86_400,
         )
 
-        ContextEventStore.getInstance(applicationContext).insert(event)
-        SyncScheduler.enqueueImmediate(applicationContext)
+        val stored = ContextEventStore.getInstance(applicationContext).insert(event)
+        if (stored) {
+            SyncScheduler.enqueueImmediate(applicationContext)
+        }
     }
 }

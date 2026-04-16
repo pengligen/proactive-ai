@@ -12,6 +12,7 @@ object AppPrefs {
     private const val KEY_ENABLED_PLUGINS = "enabled_plugins"
     private const val KEY_COLLECTION_ENABLED = "collection_enabled"
     private const val KEY_USER_ID = "user_id"
+    private const val KEY_DEVICE_ID = "device_id"
     private const val KEY_EDGE_MODEL = "edge_model"
     private const val KEY_AUTO_EXECUTE_LOW_RISK = "auto_execute_low_risk"
     private const val KEY_LOCAL_MODEL_ENABLED = "local_model_enabled"
@@ -25,6 +26,7 @@ object AppPrefs {
     private const val KEY_HF_TOKEN = "huggingface_token"
     private const val KEY_ASSISTANT_LAST_SESSION_BUCKET = "assistant_last_session_bucket"
     private const val KEY_OPENAI_API_KEY = "openai_api_key"
+    private const val KEY_MOBILE_API_BASE_URL = "mobile_api_base_url"
     private const val KEY_AUDIO_REFINE_LAST_BUCKET = "audio_refine_last_bucket"
     private const val KEY_DAILY_FOCUS_LAST_DATE = "daily_focus_last_date"
     private const val KEY_GLOBAL_LOCK_ENABLED = "global_lock_enabled"
@@ -76,6 +78,18 @@ object AppPrefs {
 
         val generated = "local-user-" + System.currentTimeMillis().toString(16)
         prefs.edit().putString(KEY_USER_ID, generated).apply()
+        return generated
+    }
+
+    fun getDeviceId(context: Context): String {
+        val prefs = prefs(context)
+        val existing = prefs.getString(KEY_DEVICE_ID, null)
+        if (!existing.isNullOrBlank()) {
+            return existing
+        }
+
+        val generated = "device-" + System.currentTimeMillis().toString(16)
+        prefs.edit().putString(KEY_DEVICE_ID, generated).apply()
         return generated
     }
 
@@ -195,6 +209,14 @@ object AppPrefs {
 
     fun setOpenAiApiKey(context: Context, apiKey: String) {
         prefs(context).edit().putString(KEY_OPENAI_API_KEY, apiKey).apply()
+    }
+
+    fun getMobileApiBaseUrl(context: Context): String {
+        return prefs(context).getString(KEY_MOBILE_API_BASE_URL, "").orEmpty()
+    }
+
+    fun setMobileApiBaseUrl(context: Context, baseUrl: String) {
+        prefs(context).edit().putString(KEY_MOBILE_API_BASE_URL, baseUrl).apply()
     }
 
     fun getAudioRefineLastBucket(context: Context): Long {

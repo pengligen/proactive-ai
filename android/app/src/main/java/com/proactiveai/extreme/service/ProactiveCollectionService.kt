@@ -118,8 +118,10 @@ class ProactiveCollectionService : Service() {
                         maybeBuildAudioGateEvent(audioGateDecision)?.let { add(it) }
                     }
 
-                    store.insertAll(finalEvents)
-                    SyncScheduler.enqueueImmediate(this@ProactiveCollectionService)
+                    val queuedUploads = store.insertAll(finalEvents)
+                    if (queuedUploads > 0) {
+                        SyncScheduler.enqueueImmediate(this@ProactiveCollectionService)
+                    }
                     maybeRunCloudSpeechRefine()
                     maybeRunAssistantAutoSession()
                     maybeRunDailyFocusTop3()

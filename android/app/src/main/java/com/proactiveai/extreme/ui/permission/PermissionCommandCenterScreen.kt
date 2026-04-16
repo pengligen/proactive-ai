@@ -99,6 +99,8 @@ import com.proactiveai.extreme.orchestrator.ActionStepPayload
 import com.proactiveai.extreme.orchestrator.ContextEventPayload
 import com.proactiveai.extreme.orchestrator.HitlDecisionPayload
 import com.proactiveai.extreme.orchestrator.HttpOrchestratorGateway
+import com.proactiveai.extreme.orchestrator.HttpMobileSyncHealthGateway
+import com.proactiveai.extreme.orchestrator.MobileSyncConfig
 import com.proactiveai.extreme.orchestrator.OrchestratorConfig
 import com.proactiveai.extreme.orchestrator.PlanRequestPayload
 import com.proactiveai.extreme.orchestrator.toMap
@@ -148,10 +150,14 @@ fun PermissionCommandCenterScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val gateway = remember(context) { HttpOrchestratorGateway(appContext = context.applicationContext) }
+    val mobileSyncHealthGateway = remember(context) {
+        HttpMobileSyncHealthGateway(context = context.applicationContext)
+    }
     val store = remember { ContextEventStore.getInstance(context) }
     var showInferenceTestDialog by remember { mutableStateOf(false) }
     var showInferenceResultDialog by remember { mutableStateOf(false) }
     var showModelConfigDialog by remember { mutableStateOf(false) }
+    var showMobileSyncConfigDialog by remember { mutableStateOf(false) }
     var inferenceTestInput by rememberSaveable {
         mutableStateOf("I have 5 unread emails and a meeting in 30 minutes, prepare me a concise brief.")
     }
@@ -160,6 +166,7 @@ fun PermissionCommandCenterScreen(
     var modelConfigPath2B by rememberSaveable { mutableStateOf(state.localModelPath2B) }
     var modelConfigPath4B by rememberSaveable { mutableStateOf(state.localModelPath4B) }
     var modelConfigOpenAiKey by rememberSaveable { mutableStateOf(state.openAiApiKey) }
+    var mobileSyncBaseUrl by rememberSaveable { mutableStateOf(state.mobileApiBaseUrl) }
     var activeAudioClipPath by rememberSaveable { mutableStateOf("") }
     var audioReplayRunning by rememberSaveable { mutableStateOf(false) }
     var cloudTranscribeRunning by rememberSaveable { mutableStateOf(false) }
@@ -1296,7 +1303,7 @@ fun PermissionCommandCenterScreen(
                             } else {
                                 state.setOrchestratorHealth(null)
                                 scope.launch(Dispatchers.IO) {
-                                    val healthy = gateway.health().getOrNull() == true
+                                    val healthy = mobileSyncHealthGateway.health().getOrNull() == true
                                     withContext(Dispatchers.Main) {
                                         state.setOrchestratorHealth(healthy)
                                     }
@@ -1312,6 +1319,10 @@ fun PermissionCommandCenterScreen(
                             state.persistCollectionEnabled(false)
                         },
                         onSyncNow = { SyncScheduler.enqueueImmediate(context) },
+                        onOpenSyncConfig = {
+                            mobileSyncBaseUrl = state.mobileApiBaseUrl
+                            showMobileSyncConfigDialog = true
+                        },
                         onFetchPlan = ::fetchPlanWithEdgeInference,
                     )
                 }
@@ -1534,6 +1545,19 @@ fun PermissionCommandCenterScreen(
         )
     }
 
+    if (showMobileSyncConfigDialog) {
+        MobileSyncConfigDialog(
+            baseUrl = mobileSyncBaseUrl,
+            deviceId = state.deviceId,
+            onBaseUrlChange = { mobileSyncBaseUrl = it },
+            onDismiss = { showMobileSyncConfigDialog = false },
+            onSave = {
+                state.persistMobileSyncConfig(baseUrl = mobileSyncBaseUrl.trim())
+                showMobileSyncConfigDialog = false
+            },
+        )
+    }
+
     if (inAppSearchAction != null && inAppSearchUrl.isNotBlank()) {
         InAppAiSearchDialog(
             title = inAppSearchAction?.label.orEmpty().ifBlank { "AI Search" },
@@ -1559,8 +1583,10 @@ private fun SummaryCard(
     onStartCollection: () -> Unit,
     onStopCollection: () -> Unit,
     onSyncNow: () -> Unit,
+    onOpenSyncConfig: () -> Unit,
     onFetchPlan: () -> Unit,
 ) {
+    val context = LocalContext.current
     Card(
         colors = CardDefaults.cardColors(
             containerColor = Color(0xFF0F172A),
@@ -1618,12 +1644,22 @@ private fun SummaryCard(
                 }
             }
             Text(
-                text = "Queued Events: ${state.unsyncedEvents}",
+                text = "Queued Uploads: ${state.unsyncedEvents}",
                 style = MaterialTheme.typography.bodySmall,
                 color = Color(0xFF94A3B8),
             )
             Text(
-                text = "Orchestrator: ${OrchestratorConfig.baseUrl()}",
+                text = "Mobile Sync API: ${MobileSyncConfig.baseUrl(context)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF94A3B8),
+            )
+            Text(
+                text = "Mobile Sync Mode: base-url only",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF15803D),
+            )
+            Text(
+                text = "Legacy Orchestrator: ${OrchestratorConfig.baseUrl()}",
                 style = MaterialTheme.typography.bodySmall,
                 color = Color(0xFF94A3B8),
             )
@@ -1653,6 +1689,9 @@ private fun SummaryCard(
                 }
                 OutlinedButton(onClick = onSyncNow) {
                     Text("Sync Now")
+                }
+                OutlinedButton(onClick = onOpenSyncConfig) {
+                    Text("Sync Config")
                 }
                 OutlinedButton(onClick = onFetchPlan) {
                     Text("Refresh Plan")
@@ -3008,6 +3047,53 @@ private fun LocalModelConfigDialog(
                     label = { Text("OpenAI API key (sk-...)") },
                     minLines = 1,
                     modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onSave) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        },
+    )
+}
+
+@Composable
+private fun MobileSyncConfigDialog(
+    baseUrl: String,
+    deviceId: String,
+    onBaseUrlChange: (String) -> Unit,
+    onDismiss: () -> Unit,
+    onSave: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text("Mobile Sync Config")
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "本地填 ngrok 地址；线上填你自己的后端地址。现在只需要 base URL。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF64748B),
+                )
+                TextField(
+                    value = baseUrl,
+                    onValueChange = onBaseUrlChange,
+                    label = { Text("API base URL") },
+                    minLines = 2,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    text = "Device ID: $deviceId",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF64748B),
                 )
             }
         },

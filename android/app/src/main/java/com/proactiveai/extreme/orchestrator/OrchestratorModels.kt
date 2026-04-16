@@ -72,3 +72,22 @@ data class ConnectorAuthorizeResultPayload(
     val authUrl: String?,
     val message: String,
 )
+
+data class MobileItemPayload(
+    val id: String,
+    val itemType: String,
+    val title: String,
+    val summary: String,
+    val payload: Map<String, Any>,
+    val salience: Double,
+    val confidence: Double,
+    val dedupeKey: String,
+    val occurredAt: Long,
+    val availableAt: Long,
+    val expiresAt: Long,
+)
+
+data class MobileItemBatchPayload(
+    val deviceId: String,
+    val items: List<MobileItemPayload>,
+)

@@ -4,12 +4,9 @@ import android.content.Context
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.proactiveai.extreme.app.AppPrefs
-import com.proactiveai.extreme.core.model.RiskLevel
-import com.proactiveai.extreme.orchestrator.EventBatchPayload
-import com.proactiveai.extreme.orchestrator.HttpOrchestratorGateway
-import com.proactiveai.extreme.orchestrator.PlanRequestPayload
+import com.proactiveai.extreme.orchestrator.HttpMobileItemsGateway
+import com.proactiveai.extreme.orchestrator.MobileItemBatchPayload
 import com.proactiveai.extreme.orchestrator.toMap
-import com.proactiveai.extreme.storage.ActionQueueStore
 import com.proactiveai.extreme.storage.ContextEventStore
 import com.proactiveai.extreme.storage.toPayload
 import org.json.JSONObject
@@ -26,55 +23,31 @@ class OrchestratorSyncWorker(
 
         val store = ContextEventStore.getInstance(applicationContext)
         store.pruneExpired()
+        store.pruneSyncedMobileItems()
 
-        val unsynced = store.getUnsynced(limit = 100)
+        val deviceId = AppPrefs.getDeviceId(applicationContext)
+        val unsynced = store.getUnsyncedMobileItems(limit = 100)
         if (unsynced.isEmpty()) {
             return Result.success()
         }
 
-        val payload = EventBatchPayload(
-            userId = AppPrefs.getUserId(applicationContext),
-            sessionId = "android-session",
-            events = unsynced.map { event ->
-                val payloadMap = jsonStringToPayloadMap(event.payloadJson)
-                event.toPayload(payloadMap)
+        val payload = MobileItemBatchPayload(
+            deviceId = deviceId,
+            items = unsynced.map { item ->
+                item.toPayload(
+                    payload = jsonStringToPayloadMap(item.payloadJson),
+                )
             },
         )
 
-        val gateway = HttpOrchestratorGateway(appContext = applicationContext)
-        val accepted = gateway.ingestEvents(payload).getOrElse { return Result.retry() }
+        val gateway = HttpMobileItemsGateway(applicationContext)
+        val accepted = gateway.ingestItems(payload).getOrElse { return Result.retry() }
         if (accepted <= 0) {
             return Result.retry()
         }
 
         val syncedIds = unsynced.take(accepted).map { it.id }
-        store.markSynced(syncedIds)
-
-        val recentContextWindow = store.getRecent(limit = 60).map { event ->
-            event.toPayload(jsonStringToPayloadMap(event.payloadJson))
-        }
-
-        val userId = AppPrefs.getUserId(applicationContext)
-        val plan = gateway.requestPlan(
-            PlanRequestPayload(
-                userId = userId,
-                now = System.currentTimeMillis(),
-                contextWindow = recentContextWindow,
-            )
-        ).getOrNull()
-
-        if (
-            plan != null &&
-            AppPrefs.isAutoExecuteLowRisk(applicationContext) &&
-            plan.riskLevel == RiskLevel.LOW &&
-            !plan.requiresUserConfirmation
-        ) {
-            val queueStore = ActionQueueStore.getInstance(applicationContext)
-            plan.steps.forEach { step ->
-                queueStore.enqueue(planId = plan.planId, step = step)
-            }
-            ActionExecutionScheduler.enqueueImmediate(applicationContext)
-        }
+        store.markMobileItemsSynced(syncedIds)
 
         return Result.success()
     }

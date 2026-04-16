@@ -341,6 +341,12 @@ class PermissionCommandCenterState internal constructor(
     var openAiApiKey by mutableStateOf(AppPrefs.getOpenAiApiKey(appContext))
         private set
 
+    var mobileApiBaseUrl by mutableStateOf(AppPrefs.getMobileApiBaseUrl(appContext))
+        private set
+
+    var deviceId by mutableStateOf(AppPrefs.getDeviceId(appContext))
+        private set
+
     var latestInferenceSummary by mutableStateOf("No on-device inference yet")
         private set
 
@@ -441,7 +447,7 @@ class PermissionCommandCenterState internal constructor(
         masterEnabled = AppPrefs.isMasterEnabled(appContext)
         collectionEnabled = AppPrefs.isCollectionEnabled(appContext)
         globalLockEnabled = AppPrefs.isGlobalLockEnabled(appContext)
-        unsyncedEvents = ContextEventStore.getInstance(appContext).countUnsynced()
+        unsyncedEvents = ContextEventStore.getInstance(appContext).countUnsyncedMobileItems()
         autoExecuteLowRisk = AppPrefs.isAutoExecuteLowRisk(appContext)
         edgeModelId = AppPrefs.getEdgeModel(appContext)
         localModelEnabled = AppPrefs.isLocalModelEnabled(appContext)
@@ -454,6 +460,8 @@ class PermissionCommandCenterState internal constructor(
         localLlamaThreads = AppPrefs.getLocalLlamaThreads(appContext)
         huggingFaceToken = AppPrefs.getHuggingFaceToken(appContext)
         openAiApiKey = AppPrefs.getOpenAiApiKey(appContext)
+        mobileApiBaseUrl = AppPrefs.getMobileApiBaseUrl(appContext)
+        deviceId = AppPrefs.getDeviceId(appContext)
         refreshMetrics()
 
         _plugins.clear()
@@ -562,6 +570,12 @@ class PermissionCommandCenterState internal constructor(
     fun persistOpenAiApiKey(apiKey: String) {
         AppPrefs.setOpenAiApiKey(appContext, apiKey)
         openAiApiKey = apiKey
+    }
+
+    fun persistMobileSyncConfig(baseUrl: String) {
+        AppPrefs.setMobileApiBaseUrl(appContext, baseUrl)
+        mobileApiBaseUrl = baseUrl
+        deviceId = AppPrefs.getDeviceId(appContext)
     }
 
     fun setInference(result: EdgeInferenceResult) {
