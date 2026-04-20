@@ -183,4 +183,106 @@ class ItemDerivationEngineTest {
         assertEquals("communication:call:14:missed", callItems.single().dedupeKey)
         assertTrue(contactsItems.isEmpty())
     }
+
+    @Test
+    fun `bootstrap snapshots become syncable items and bootstrap calendar uses bootstrap state`() {
+        val contactsEvent = ContextEvent(
+            eventId = "bootstrap-contacts-1",
+            occurredAt = 60_000L,
+            source = "bootstrap_runner",
+            category = "contact_bootstrap",
+            summary = "Bootstrap contacts snapshot: 404 contacts, 350 identities",
+            payload = mapOf(
+                "contactsCount" to 404,
+                "identityCount" to 350,
+                "maxLastUpdatedTs" to 1_775_082_493_391L,
+                "contactsIncluded" to 1,
+                "contactsTruncated" to false,
+                "contacts" to listOf(
+                    mapOf(
+                        "contactId" to "1",
+                        "displayName" to "Alice",
+                        "phonesMasked" to listOf("+8***78"),
+                        "emailsMasked" to listOf("al***om"),
+                        "identityHashes" to listOf("hash-1"),
+                    ),
+                ),
+            ),
+            sensitivity = Sensitivity.HIGH,
+            ttlSeconds = 86_400,
+        )
+        val appsEvent = ContextEvent(
+            eventId = "bootstrap-apps-1",
+            occurredAt = 61_000L,
+            source = "bootstrap_runner",
+            category = "app_inventory_bootstrap",
+            summary = "Bootstrap app inventory: 311 installed packages",
+            payload = mapOf(
+                "appCount" to 311,
+                "lastUpdateTimeMax" to 1_776_484_683_674L,
+                "appsIncluded" to 1,
+                "appsTruncated" to false,
+                "apps" to listOf(
+                    mapOf(
+                        "packageName" to "com.pin.app",
+                        "label" to "Pin AI",
+                    ),
+                ),
+            ),
+            sensitivity = Sensitivity.MEDIUM,
+            ttlSeconds = 86_400,
+        )
+        val smsEvent = ContextEvent(
+            eventId = "bootstrap-sms-1",
+            occurredAt = 62_000L,
+            source = "bootstrap_runner",
+            category = "sms_bootstrap",
+            summary = "Bootstrap SMS from 10***91",
+            payload = mapOf(
+                "smsId" to 46,
+                "address" to "10***91",
+                "bodySnippet" to "验证码",
+            ),
+            sensitivity = Sensitivity.HIGH,
+            ttlSeconds = 86_400,
+        )
+        val calendarEvent = ContextEvent(
+            eventId = "bootstrap-calendar-1",
+            occurredAt = 63_000L,
+            source = "bootstrap_runner",
+            category = "calendar_bootstrap",
+            summary = "Bootstrap calendar: Pin AI Team Meeting",
+            payload = mapOf(
+                "eventId" to 88,
+                "title" to "Pin AI Team Meeting",
+            ),
+            sensitivity = Sensitivity.MEDIUM,
+            ttlSeconds = 86_400,
+        )
+
+        val contactItems = ItemDerivationEngine.derive(contactsEvent)
+        val appItems = ItemDerivationEngine.derive(appsEvent)
+        val smsItems = ItemDerivationEngine.derive(smsEvent)
+        val calendarItems = ItemDerivationEngine.derive(calendarEvent)
+
+        assertEquals("contact_directory_snapshot", contactItems.single().itemType)
+        assertEquals(
+            "contact_bootstrap:404:350:1775082493391",
+            contactItems.single().dedupeKey,
+        )
+        @Suppress("UNCHECKED_CAST")
+        val contactPayload = contactItems.single().payload["contacts"] as List<Map<String, Any>>
+        assertEquals("Alice", contactPayload.single()["displayName"])
+        assertEquals(listOf("+8***78"), contactPayload.single()["phonesMasked"])
+        assertEquals("app_inventory_snapshot", appItems.single().itemType)
+        assertEquals(
+            "app_inventory_bootstrap:311:1776484683674",
+            appItems.single().dedupeKey,
+        )
+        @Suppress("UNCHECKED_CAST")
+        val appPayload = appItems.single().payload["apps"] as List<Map<String, Any>>
+        assertEquals("Pin AI", appPayload.single()["label"])
+        assertEquals("communication:sms:46", smsItems.single().dedupeKey)
+        assertEquals("calendar:88:bootstrap", calendarItems.single().dedupeKey)
+    }
 }

@@ -15,9 +15,11 @@ object ItemDerivationEngine {
             )
             "daily_focus" -> dailyFocusItems(event)
             "notification" -> listOfNotNull(notificationItem(event))
-            "calendar" -> listOfNotNull(calendarItem(event))
-            "communication" -> listOfNotNull(communicationItem(event))
+            "calendar", "calendar_bootstrap" -> listOfNotNull(calendarItem(event))
+            "communication", "sms_bootstrap", "call_log_bootstrap" -> listOfNotNull(communicationItem(event))
             "audio" -> listOfNotNull(audioSessionItem(event))
+            "contact_bootstrap" -> listOfNotNull(contactBootstrapItem(event))
+            "app_inventory_bootstrap" -> listOfNotNull(appInventoryBootstrapItem(event))
             "location", "connectivity", "device_state", "app_usage", "sensor" -> emptyList()
             else -> emptyList()
         }
@@ -141,7 +143,9 @@ object ItemDerivationEngine {
 
     private fun calendarItem(event: ContextEvent): MobileSyncItem? {
         val eventId = stringValue(event.payload["eventId"]).ifBlank { return null }
-        val state = stringValue(event.payload["state"]).ifBlank { "unknown" }
+        val state = stringValue(event.payload["state"]).ifBlank {
+            if (event.category.equals("calendar_bootstrap", ignoreCase = true)) "bootstrap" else "unknown"
+        }
         return attentionItem(
             event = event,
             dedupeKey = "calendar:$eventId:$state",
@@ -192,6 +196,50 @@ object ItemDerivationEngine {
             salience = 0.7,
             confidence = 0.75,
             dedupeKey = "audio:${event.eventId}",
+            occurredAt = event.occurredAt,
+            expiresAt = event.occurredAt + minOf(event.ttlSeconds * 1000L, DEFAULT_ITEM_TTL_MS),
+        )
+    }
+
+    private fun contactBootstrapItem(event: ContextEvent): MobileSyncItem? {
+        val contactsCount = intValue(event.payload["contactsCount"])
+        if (contactsCount <= 0) return null
+        val identityCount = intValue(event.payload["identityCount"])
+        val marker = listOf(
+            contactsCount,
+            identityCount,
+            stringValue(event.payload["maxLastUpdatedTs"]).ifBlank { "0" },
+        ).joinToString(":")
+        return MobileSyncItem(
+            itemId = UUID.randomUUID().toString(),
+            itemType = "contact_directory_snapshot",
+            title = "Contacts snapshot",
+            summary = "$contactsCount contacts, $identityCount identities".take(220),
+            payload = event.payload,
+            salience = 0.74,
+            confidence = 0.86,
+            dedupeKey = "contact_bootstrap:$marker",
+            occurredAt = event.occurredAt,
+            expiresAt = event.occurredAt + minOf(event.ttlSeconds * 1000L, DEFAULT_ITEM_TTL_MS),
+        )
+    }
+
+    private fun appInventoryBootstrapItem(event: ContextEvent): MobileSyncItem? {
+        val appCount = intValue(event.payload["appCount"])
+        if (appCount <= 0) return null
+        val marker = listOf(
+            appCount,
+            stringValue(event.payload["lastUpdateTimeMax"]).ifBlank { "0" },
+        ).joinToString(":")
+        return MobileSyncItem(
+            itemId = UUID.randomUUID().toString(),
+            itemType = "app_inventory_snapshot",
+            title = "Installed apps snapshot",
+            summary = "$appCount installed packages".take(220),
+            payload = event.payload,
+            salience = 0.58,
+            confidence = 0.82,
+            dedupeKey = "app_inventory_bootstrap:$marker",
             occurredAt = event.occurredAt,
             expiresAt = event.occurredAt + minOf(event.ttlSeconds * 1000L, DEFAULT_ITEM_TTL_MS),
         )

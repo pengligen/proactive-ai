@@ -175,7 +175,10 @@ object AssistantSessionAutoRunner {
                 kotlin.runCatching { item.toPayload(payload) }.getOrNull()
             }
             .filterNot { event ->
-                event.source == "local_model" || event.category == "model_io" || event.category == "assistant_session"
+                event.source == "local_model" ||
+                    event.category == "model_io" ||
+                    event.category == "assistant_session" ||
+                    event.category.endsWith("_bootstrap", ignoreCase = true)
             }
     }
 

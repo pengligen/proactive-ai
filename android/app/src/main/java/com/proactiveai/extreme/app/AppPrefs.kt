@@ -30,6 +30,8 @@ object AppPrefs {
     private const val KEY_AUDIO_REFINE_LAST_BUCKET = "audio_refine_last_bucket"
     private const val KEY_DAILY_FOCUS_LAST_DATE = "daily_focus_last_date"
     private const val KEY_GLOBAL_LOCK_ENABLED = "global_lock_enabled"
+    private const val KEY_AUTO_MODEL_SUPPRESSED_UNTIL_MS = "auto_model_suppressed_until_ms"
+    private const val KEY_UI_FOREGROUND_VISIBLE = "ui_foreground_visible"
 
     private const val KEY_METRIC_SUGGESTIONS_TOTAL = "metric_suggestions_total"
     private const val KEY_METRIC_SUGGESTIONS_ACCEPTED = "metric_suggestions_accepted"
@@ -241,6 +243,52 @@ object AppPrefs {
 
     fun setGlobalLockEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_GLOBAL_LOCK_ENABLED, enabled).apply()
+    }
+
+    fun getAutoModelSuppressedUntilMs(context: Context): Long {
+        return prefs(context).getLong(KEY_AUTO_MODEL_SUPPRESSED_UNTIL_MS, 0L)
+    }
+
+    fun setAutoModelSuppressedUntilMs(context: Context, untilMs: Long) {
+        prefs(context).edit().putLong(KEY_AUTO_MODEL_SUPPRESSED_UNTIL_MS, untilMs).apply()
+    }
+
+    fun isUiForegroundVisible(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_UI_FOREGROUND_VISIBLE, false)
+    }
+
+    fun setUiForegroundVisible(context: Context, visible: Boolean) {
+        prefs(context).edit().putBoolean(KEY_UI_FOREGROUND_VISIBLE, visible).apply()
+    }
+
+    fun markUiForegrounded(
+        context: Context,
+        nowMs: Long = System.currentTimeMillis(),
+        cooldownMs: Long = AutoModelForegroundGate.DEFAULT_COOLDOWN_MS,
+    ) {
+        setUiForegroundVisible(context, true)
+        setAutoModelSuppressedUntilMs(
+            context = context,
+            untilMs = AutoModelForegroundGate.extendSuppressionWindow(
+                nowMs = nowMs,
+                cooldownMs = cooldownMs,
+            ),
+        )
+    }
+
+    fun markUiBackgrounded(context: Context) {
+        setUiForegroundVisible(context, false)
+    }
+
+    fun shouldSuppressAutoModelWork(
+        context: Context,
+        nowMs: Long = System.currentTimeMillis(),
+    ): Boolean {
+        return AutoModelForegroundGate.shouldSuppressAutoModelWork(
+            nowMs = nowMs,
+            suppressUntilMs = getAutoModelSuppressedUntilMs(context),
+            isUiForegroundVisible = isUiForegroundVisible(context),
+        )
     }
 
     fun getEvaluationMetrics(context: Context): EvaluationMetrics {

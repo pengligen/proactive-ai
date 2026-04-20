@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.proactiveai.extreme.core.context.ContextEvent
+import com.proactiveai.extreme.orchestrator.toMap
 import org.json.JSONObject
 
 class ContextEventStore private constructor(context: Context) :
@@ -14,6 +15,9 @@ class ContextEventStore private constructor(context: Context) :
         createContextEventsTable(db)
         createMobileItemsOutboxTable(db)
         createCollectorStateTable(db)
+        createContactDirectoryTable(db)
+        createContactIdentityIndexTable(db)
+        createAppInventoryStateTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -23,6 +27,11 @@ class ContextEventStore private constructor(context: Context) :
         }
         if (oldVersion in 2 until 3) {
             db.execSQL("ALTER TABLE $TABLE_MOBILE_ITEMS ADD COLUMN synced_at INTEGER")
+        }
+        if (oldVersion < 4) {
+            createContactDirectoryTable(db)
+            createContactIdentityIndexTable(db)
+            createAppInventoryStateTable(db)
         }
     }
 
@@ -79,6 +88,16 @@ class ContextEventStore private constructor(context: Context) :
         )
 
         return cursor.use { mapCursorToEvents(it) }
+    }
+
+    fun countEventsByCategory(category: String): Int {
+        val cursor = readableDatabase.rawQuery(
+            "SELECT COUNT(1) FROM $TABLE_EVENTS WHERE category = ?",
+            arrayOf(category),
+        )
+        return cursor.use {
+            if (it.moveToFirst()) it.getInt(0) else 0
+        }
     }
 
     fun pruneExpired(nowMs: Long = System.currentTimeMillis()) {
@@ -141,6 +160,191 @@ class ContextEventStore private constructor(context: Context) :
         return cursor.use {
             if (it.moveToFirst()) it.getInt(0) else 0
         }
+    }
+
+    fun backfillDerivedItemsForCategories(categories: Set<String>, limit: Int = 600): Int {
+        if (categories.isEmpty()) return 0
+        val placeholders = categories.joinToString(separator = ",") { "?" }
+        val args = categories.toTypedArray()
+        val cursor = readableDatabase.query(
+            TABLE_EVENTS,
+            arrayOf(
+                "id",
+                "event_id",
+                "occurred_at",
+                "source",
+                "category",
+                "summary",
+                "payload_json",
+                "sensitivity",
+                "ttl_seconds",
+                "synced",
+            ),
+            "category IN ($placeholders)",
+            args,
+            null,
+            null,
+            "occurred_at DESC",
+            limit.toString(),
+        )
+        val events = cursor.use { mapCursorToEvents(it) }
+            .mapNotNull { stored ->
+                kotlin.runCatching {
+                    val payload = JSONObject(stored.payloadJson).toMap()
+                    val compactPayload = buildMap<String, Any> {
+                        payload.forEach { (key, value) ->
+                            if (key.isNotBlank() && value != null) {
+                                put(key, value)
+                            }
+                        }
+                    }
+                    ContextEvent(
+                        eventId = stored.eventId,
+                        occurredAt = stored.occurredAt,
+                        source = stored.source,
+                        category = stored.category,
+                        summary = stored.summary,
+                        payload = compactPayload,
+                        sensitivity = kotlin.runCatching {
+                            com.proactiveai.extreme.core.context.Sensitivity.valueOf(stored.sensitivity)
+                        }.getOrDefault(com.proactiveai.extreme.core.context.Sensitivity.MEDIUM),
+                        ttlSeconds = stored.ttlSeconds,
+                    )
+                }.getOrNull()
+            }
+        if (events.isEmpty()) return 0
+
+        val db = writableDatabase
+        var inserted = 0
+        db.beginTransaction()
+        try {
+            events.forEach { event ->
+                inserted += enqueueDerivedItems(event, db)
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return inserted
+    }
+
+    fun getCollectorState(key: String): String? {
+        val cursor = readableDatabase.query(
+            TABLE_COLLECTOR_STATE,
+            arrayOf("value"),
+            "state_key = ?",
+            arrayOf(key),
+            null,
+            null,
+            null,
+            "1",
+        )
+        return cursor.use {
+            if (it.moveToFirst()) it.getString(0) else null
+        }
+    }
+
+    fun putCollectorState(key: String, value: String) {
+        val values = ContentValues().apply {
+            put("state_key", key)
+            put("value", value)
+            put("updated_at", System.currentTimeMillis())
+        }
+        writableDatabase.insertWithOnConflict(TABLE_COLLECTOR_STATE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun removeCollectorState(key: String) {
+        writableDatabase.delete(TABLE_COLLECTOR_STATE, "state_key = ?", arrayOf(key))
+    }
+
+    fun replaceContactDirectory(
+        contacts: List<ContactDirectoryRow>,
+        identities: List<ContactIdentityRow>,
+        nowMs: Long = System.currentTimeMillis(),
+    ) {
+        withWritableTransaction { db ->
+            db.delete(TABLE_CONTACT_IDENTITY_INDEX, null, null)
+            db.delete(TABLE_CONTACT_DIRECTORY, null, null)
+
+            contacts.forEach { row ->
+                val values = ContentValues().apply {
+                    put("contact_id", row.contactId)
+                    put("lookup_key", row.lookupKey)
+                    put("display_name", row.displayName)
+                    put("display_name_alt", row.displayNameAlt)
+                    put("photo_uri", row.photoUri)
+                    put("starred", if (row.starred) 1 else 0)
+                    put("organization", row.organization)
+                    put("title", row.title)
+                    put("note", row.note)
+                    put("relations_json", row.relationsJson)
+                    put("events_json", row.eventsJson)
+                    put("groups_json", row.groupsJson)
+                    put("account_type", row.accountType)
+                    put("account_name", row.accountName)
+                    put("last_updated_ts", row.lastUpdatedTs)
+                    put("last_contacted_ts", row.lastContactedTs)
+                    put("times_contacted", row.timesContacted)
+                    put("last_seen_scan_id", row.lastSeenScanId)
+                    put("content_hash", row.contentHash)
+                    put("deleted", 0)
+                    put("updated_at", nowMs)
+                }
+                db.insertWithOnConflict(TABLE_CONTACT_DIRECTORY, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+            }
+
+            identities.forEach { row ->
+                val values = ContentValues().apply {
+                    put("contact_id", row.contactId)
+                    put("kind", row.kind)
+                    put("normalized_value", row.normalizedValue)
+                    put("normalized_hash", row.normalizedHash)
+                    put("label", row.label)
+                    put("is_primary", if (row.isPrimary) 1 else 0)
+                    put("updated_at", nowMs)
+                }
+                db.insertWithOnConflict(TABLE_CONTACT_IDENTITY_INDEX, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+            }
+        }
+    }
+
+    fun replaceAppInventory(
+        apps: List<AppInventoryRow>,
+        nowMs: Long = System.currentTimeMillis(),
+    ) {
+        withWritableTransaction { db ->
+            db.delete(TABLE_APP_INVENTORY_STATE, null, null)
+            apps.forEach { row ->
+                val values = ContentValues().apply {
+                    put("package_name", row.packageName)
+                    put("app_label", row.appLabel)
+                    put("version_name", row.versionName)
+                    put("version_code", row.versionCode)
+                    put("first_install_time", row.firstInstallTime)
+                    put("last_update_time", row.lastUpdateTime)
+                    put("content_hash", row.contentHash)
+                    put("deleted", 0)
+                    put("updated_at", nowMs)
+                }
+                db.insertWithOnConflict(TABLE_APP_INVENTORY_STATE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+            }
+        }
+    }
+
+    fun <T> withWritableTransaction(block: (SQLiteDatabase) -> T): T {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val result = block(db)
+            db.setTransactionSuccessful()
+            return result
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    fun <T> withReadableDatabase(block: (SQLiteDatabase) -> T): T {
+        return block(readableDatabase)
     }
 
     private fun mapCursorToEvents(cursor: android.database.Cursor): List<StoredContextEvent> {
@@ -322,12 +526,111 @@ class ContextEventStore private constructor(context: Context) :
         )
     }
 
+    private fun createContactDirectoryTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $TABLE_CONTACT_DIRECTORY (
+                contact_id INTEGER PRIMARY KEY,
+                lookup_key TEXT,
+                display_name TEXT NOT NULL,
+                display_name_alt TEXT,
+                photo_uri TEXT,
+                starred INTEGER NOT NULL DEFAULT 0,
+                organization TEXT,
+                title TEXT,
+                note TEXT,
+                relations_json TEXT NOT NULL DEFAULT '[]',
+                events_json TEXT NOT NULL DEFAULT '[]',
+                groups_json TEXT NOT NULL DEFAULT '[]',
+                account_type TEXT,
+                account_name TEXT,
+                last_updated_ts INTEGER,
+                last_contacted_ts INTEGER,
+                times_contacted INTEGER,
+                last_seen_scan_id TEXT,
+                content_hash TEXT NOT NULL,
+                deleted INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS idx_contact_directory_last_seen_scan
+            ON $TABLE_CONTACT_DIRECTORY(last_seen_scan_id)
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS idx_contact_directory_deleted
+            ON $TABLE_CONTACT_DIRECTORY(deleted)
+            """.trimIndent()
+        )
+    }
+
+    private fun createContactIdentityIndexTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $TABLE_CONTACT_IDENTITY_INDEX (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                contact_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                normalized_value TEXT NOT NULL,
+                normalized_hash TEXT NOT NULL,
+                label TEXT,
+                is_primary INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(contact_id, kind, normalized_value)
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS idx_contact_identity_hash
+            ON $TABLE_CONTACT_IDENTITY_INDEX(normalized_hash)
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS idx_contact_identity_contact
+            ON $TABLE_CONTACT_IDENTITY_INDEX(contact_id)
+            """.trimIndent()
+        )
+    }
+
+    private fun createAppInventoryStateTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $TABLE_APP_INVENTORY_STATE (
+                package_name TEXT PRIMARY KEY,
+                app_label TEXT NOT NULL,
+                version_name TEXT,
+                version_code INTEGER,
+                first_install_time INTEGER,
+                last_update_time INTEGER,
+                content_hash TEXT NOT NULL,
+                deleted INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS idx_app_inventory_deleted
+            ON $TABLE_APP_INVENTORY_STATE(deleted)
+            """.trimIndent()
+        )
+    }
+
     companion object {
         private const val DB_NAME = "proactive_events.db"
-        private const val DB_VERSION = 3
+        private const val DB_VERSION = 4
         private const val TABLE_EVENTS = "context_events"
         private const val TABLE_MOBILE_ITEMS = "mobile_items_outbox"
         private const val TABLE_COLLECTOR_STATE = "collector_state"
+        private const val TABLE_CONTACT_DIRECTORY = "contact_directory"
+        private const val TABLE_CONTACT_IDENTITY_INDEX = "contact_identity_index"
+        private const val TABLE_APP_INVENTORY_STATE = "app_inventory_state"
         private const val SYNCED_ITEM_RETENTION_MS = 24 * 60 * 60 * 1000L
 
         @Volatile

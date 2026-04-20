@@ -6,9 +6,11 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.proactiveai.extreme.app.AppPrefs
 import com.proactiveai.extreme.core.context.ContextEvent
@@ -43,8 +45,10 @@ class ProactiveCollectionService : Service() {
     private var assistantAutoRunning = false
     private var dailyFocusAutoRunning = false
     private var cloudRefineRunning = false
+    private var bootstrapInitRunning = false
     private var lastAudioGateSignature = ""
     private var lastAudioGateEventAt = 0L
+    private var lastForegroundServiceTypes = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -87,7 +91,7 @@ class ProactiveCollectionService : Service() {
         restartAttempted = false
 
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("Collecting context every 1 minute in Extreme Mode"))
+        updateForegroundServiceState(includeMicrophone = false)
         SyncScheduler.ensurePeriodic(this)
 
         serviceScope.launch {
@@ -100,10 +104,20 @@ class ProactiveCollectionService : Service() {
                         store = store,
                         configuredPlugins = configuredPlugins,
                     )
-                    val runtimePlugins = if (audioGateDecision.allowAudio) {
+                    val desiredRuntimePlugins = if (audioGateDecision.allowAudio) {
                         configuredPlugins
                     } else {
                         configuredPlugins - AUDIO_PLUGIN_ID
+                    }
+                    val shouldEnableAudioForeground = AUDIO_PLUGIN_ID in desiredRuntimePlugins &&
+                        AppPrefs.isUiForegroundVisible(this@ProactiveCollectionService)
+                    val microphoneForegroundReady = updateForegroundServiceState(
+                        includeMicrophone = shouldEnableAudioForeground,
+                    )
+                    val runtimePlugins = if (shouldEnableAudioForeground && !microphoneForegroundReady) {
+                        desiredRuntimePlugins - AUDIO_PLUGIN_ID
+                    } else {
+                        desiredRuntimePlugins
                     }
 
                     contextEngine.startEnabled(runtimePlugins)
@@ -122,6 +136,7 @@ class ProactiveCollectionService : Service() {
                     if (queuedUploads > 0) {
                         SyncScheduler.enqueueImmediate(this@ProactiveCollectionService)
                     }
+                    maybeRunInitialDataBootstrap()
                     maybeRunCloudSpeechRefine()
                     maybeRunAssistantAutoSession()
                     maybeRunDailyFocusTop3()
@@ -230,6 +245,38 @@ class ProactiveCollectionService : Service() {
         manager.createNotificationChannel(channel)
     }
 
+    private fun updateForegroundServiceState(includeMicrophone: Boolean): Boolean {
+        val baseTypes = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+        val targetTypes = if (includeMicrophone) {
+            baseTypes or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        } else {
+            baseTypes
+        }
+        if (lastForegroundServiceTypes == targetTypes) {
+            return !includeMicrophone || AppPrefs.isUiForegroundVisible(this)
+        }
+
+        val notification = buildNotification("Collecting context every 1 minute in Extreme Mode")
+        val applied = kotlin.runCatching {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, targetTypes)
+            true
+        }.getOrElse {
+            if (includeMicrophone) {
+                kotlin.runCatching {
+                    ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, baseTypes)
+                }
+                lastForegroundServiceTypes = baseTypes
+            }
+            false
+        }
+
+        if (applied) {
+            lastForegroundServiceTypes = targetTypes
+        }
+        return applied
+    }
+
     private fun recoverIfNeeded() {
         val shouldRecover = !stopRequested &&
             !running &&
@@ -246,7 +293,7 @@ class ProactiveCollectionService : Service() {
     }
 
     private fun maybeRunAssistantAutoSession() {
-        if (assistantAutoRunning) return
+        if (assistantAutoRunning || AppPrefs.shouldSuppressAutoModelWork(this)) return
         assistantAutoRunning = true
         serviceScope.launch {
             try {
@@ -259,7 +306,7 @@ class ProactiveCollectionService : Service() {
     }
 
     private fun maybeRunCloudSpeechRefine() {
-        if (cloudRefineRunning) return
+        if (cloudRefineRunning || AppPrefs.shouldSuppressAutoModelWork(this)) return
         cloudRefineRunning = true
         serviceScope.launch {
             try {
@@ -272,7 +319,7 @@ class ProactiveCollectionService : Service() {
     }
 
     private fun maybeRunDailyFocusTop3() {
-        if (dailyFocusAutoRunning) return
+        if (dailyFocusAutoRunning || AppPrefs.shouldSuppressAutoModelWork(this)) return
         dailyFocusAutoRunning = true
         serviceScope.launch {
             try {
@@ -280,6 +327,19 @@ class ProactiveCollectionService : Service() {
             } catch (_: Throwable) {
             } finally {
                 dailyFocusAutoRunning = false
+            }
+        }
+    }
+
+    private fun maybeRunInitialDataBootstrap() {
+        if (bootstrapInitRunning) return
+        bootstrapInitRunning = true
+        serviceScope.launch {
+            try {
+                InitialDataBootstrapRunner.runPending(this@ProactiveCollectionService)
+            } catch (_: Throwable) {
+            } finally {
+                bootstrapInitRunning = false
             }
         }
     }

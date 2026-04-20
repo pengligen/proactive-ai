@@ -27,11 +27,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        AppPrefs.markUiForegrounded(this)
         SyncScheduler.ensurePeriodic(this)
         ActionExecutionScheduler.ensurePeriodic(this)
-        if (AppPrefs.isCollectionEnabled(this)) {
-            ProactiveCollectionService.start(this)
-        }
         maybeRunLlamaSelfTest()
 
         setContent {
@@ -73,5 +71,23 @@ class MainActivity : ComponentActivity() {
                 "LITERTLM_SELFTEST used=${result.usedNativeModel} message=${result.message} output=${result.output?.take(120)}",
             )
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        AppPrefs.markUiForegrounded(this)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        AppPrefs.markUiForegrounded(this)
+        if (AppPrefs.isCollectionEnabled(this)) {
+            ProactiveCollectionService.start(this)
+        }
+    }
+
+    override fun onStop() {
+        AppPrefs.markUiBackgrounded(this)
+        super.onStop()
     }
 }
