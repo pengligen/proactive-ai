@@ -93,6 +93,7 @@ import com.proactiveai.extreme.core.edge.EdgeModelProfile
 import com.proactiveai.extreme.core.edge.EdgeInferenceTrace
 import com.proactiveai.extreme.core.edge.LocalModelBackend
 import com.proactiveai.extreme.core.edge.LocalModelRuntimeConfig
+import com.proactiveai.extreme.core.edge.ModelDownloadPlan
 import com.proactiveai.extreme.core.edge.OnDeviceInferenceEngine
 import com.proactiveai.extreme.core.model.PermissionGate
 import com.proactiveai.extreme.core.model.RiskLevel
@@ -186,6 +187,15 @@ fun PermissionCommandCenterScreen(
     var modelConfigPath2B by rememberSaveable { mutableStateOf(state.localModelPath2B) }
     var modelConfigPath4B by rememberSaveable { mutableStateOf(state.localModelPath4B) }
     var modelConfigOpenAiKey by rememberSaveable { mutableStateOf(state.openAiApiKey) }
+    var selectedModelDownloadProfile by rememberSaveable { mutableStateOf(EdgeModelProfile.GEMMA_EFFECTIVE_2B.id) }
+    var modelDownloadUrl2B by rememberSaveable {
+        mutableStateOf(ModelDownloadPlan.defaultUrlFor(EdgeModelProfile.GEMMA_EFFECTIVE_2B))
+    }
+    var modelDownloadUrl4B by rememberSaveable {
+        mutableStateOf(ModelDownloadPlan.defaultUrlFor(EdgeModelProfile.GEMMA_EFFECTIVE_4B))
+    }
+    var modelDownloadToken by rememberSaveable { mutableStateOf(state.huggingFaceToken) }
+    var modelDownloadInFlight by rememberSaveable { mutableStateOf(false) }
     var mobileSyncBaseUrl by rememberSaveable { mutableStateOf(state.mobileApiBaseUrl) }
     var activeAudioClipPath by rememberSaveable { mutableStateOf("") }
     var audioReplayRunning by rememberSaveable { mutableStateOf(false) }
@@ -261,6 +271,35 @@ fun PermissionCommandCenterScreen(
                 } else {
                     state.updateConnectorStatusMessage("Failed to load connectors")
                 }
+            }
+        }
+    }
+
+    fun downloadSelectedModelToPrivateStorage() {
+        if (modelDownloadInFlight) return
+        val selectedProfile = EdgeModelProfile.fromId(selectedModelDownloadProfile)
+        if (isGlobalLocked()) {
+            val profileLabel = ModelDownloadPlan.shortLabelFor(selectedProfile)
+            markLockBlocked("$profileLabel model download")
+            state.updateModelDownloadProgress(-1)
+            state.updateModelDownloadStatus("Global lock enabled: $profileLabel model download blocked.")
+            return
+        }
+
+        modelDownloadInFlight = true
+        scope.launch {
+            try {
+                state.downloadAndActivateModel(
+                    profile = selectedProfile,
+                    downloadUrl = modelDownloadDraftForProfile(
+                        selectedProfile = selectedProfile,
+                        url2B = modelDownloadUrl2B,
+                        url4B = modelDownloadUrl4B,
+                    ),
+                    huggingFaceToken = modelDownloadToken,
+                )
+            } finally {
+                modelDownloadInFlight = false
             }
         }
     }
@@ -1421,6 +1460,25 @@ fun PermissionCommandCenterScreen(
                             modelConfigOpenAiKey = state.openAiApiKey
                             showModelConfigDialog = true
                         },
+                        selectedDownloadProfile = EdgeModelProfile.fromId(selectedModelDownloadProfile),
+                        modelDownloadUrl = modelDownloadDraftForProfile(
+                            selectedProfile = EdgeModelProfile.fromId(selectedModelDownloadProfile),
+                            url2B = modelDownloadUrl2B,
+                            url4B = modelDownloadUrl4B,
+                        ),
+                        modelDownloadToken = modelDownloadToken,
+                        modelDownloadInFlight = modelDownloadInFlight,
+                        onDownloadTargetSelected = { profile ->
+                            selectedModelDownloadProfile = profile.id
+                        },
+                        onModelDownloadUrlChange = { updated ->
+                            when (EdgeModelProfile.fromId(selectedModelDownloadProfile)) {
+                                EdgeModelProfile.GEMMA_EFFECTIVE_2B -> modelDownloadUrl2B = updated
+                                EdgeModelProfile.GEMMA_EFFECTIVE_4B -> modelDownloadUrl4B = updated
+                            }
+                        },
+                        onModelDownloadTokenChange = { modelDownloadToken = it },
+                        onDownloadModel = ::downloadSelectedModelToPrivateStorage,
                         onRefreshModelCalls = { state.refreshModelInteractions() },
                     )
                 }
@@ -1782,6 +1840,14 @@ private fun ModelManagementCard(
     onModelSelected: (String) -> Unit,
     onOpenInferenceTest: () -> Unit,
     onOpenModelConfig: () -> Unit,
+    selectedDownloadProfile: EdgeModelProfile,
+    modelDownloadUrl: String,
+    modelDownloadToken: String,
+    modelDownloadInFlight: Boolean,
+    onDownloadTargetSelected: (EdgeModelProfile) -> Unit,
+    onModelDownloadUrlChange: (String) -> Unit,
+    onModelDownloadTokenChange: (String) -> Unit,
+    onDownloadModel: () -> Unit,
     onRefreshModelCalls: () -> Unit,
 ) {
     val selectedModel = EdgeModelProfile.fromId(state.edgeModelId)
@@ -1840,13 +1906,90 @@ private fun ModelManagementCard(
             )
         }
 
+        CommandCenterInsetPanel {
+            Text(
+                text = "Model Hub Download",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Text(
+                text = "Download LiteRT-LM models into app private storage and activate the selected profile immediately after success.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            CompactActionButtonGrid(
+                actions = state.edgeModelOptions.map { option ->
+                    CompactActionButtonSpec(
+                        label = option.label,
+                        onClick = { onDownloadTargetSelected(option) },
+                        outlined = option != selectedDownloadProfile,
+                    )
+                },
+            )
+
+            TextField(
+                value = modelDownloadUrl,
+                onValueChange = onModelDownloadUrlChange,
+                label = {
+                    Text("${ModelDownloadPlan.shortLabelFor(selectedDownloadProfile)} model direct URL")
+                },
+                minLines = 2,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            TextField(
+                value = modelDownloadToken,
+                onValueChange = onModelDownloadTokenChange,
+                label = { Text("Hugging Face token (optional)") },
+                minLines = 1,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                text = "Download status: ${state.modelDownloadStatus}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = "Download progress: ${if (state.modelDownloadProgress >= 0) "${state.modelDownloadProgress}%" else "<idle>"}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
         CompactActionButtonGrid(
             actions = listOf(
                 CompactActionButtonSpec(label = "Inference Test", onClick = onOpenInferenceTest, outlined = false),
                 CompactActionButtonSpec(label = "Model Config", onClick = onOpenModelConfig),
+                CompactActionButtonSpec(
+                    label = modelDownloadActionLabel(selectedDownloadProfile, modelDownloadInFlight),
+                    onClick = onDownloadModel,
+                    enabled = !modelDownloadInFlight,
+                ),
                 CompactActionButtonSpec(label = "Refresh Calls", onClick = onRefreshModelCalls),
             ),
         )
+    }
+}
+
+internal fun modelDownloadActionLabel(
+    selectedProfile: EdgeModelProfile,
+    downloadInFlight: Boolean,
+): String {
+    if (downloadInFlight) {
+        return "Downloading..."
+    }
+    return "Download ${ModelDownloadPlan.shortLabelFor(selectedProfile)}"
+}
+
+internal fun modelDownloadDraftForProfile(
+    selectedProfile: EdgeModelProfile,
+    url2B: String,
+    url4B: String,
+): String {
+    return when (selectedProfile) {
+        EdgeModelProfile.GEMMA_EFFECTIVE_2B -> url2B
+        EdgeModelProfile.GEMMA_EFFECTIVE_4B -> url4B
     }
 }
 

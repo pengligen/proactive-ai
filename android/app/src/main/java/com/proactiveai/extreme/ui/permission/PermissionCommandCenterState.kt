@@ -20,6 +20,8 @@ import com.proactiveai.extreme.core.edge.EdgeInferenceResult
 import com.proactiveai.extreme.core.edge.EdgeModelProfile
 import com.proactiveai.extreme.core.edge.LocalModelBackend
 import com.proactiveai.extreme.core.edge.LocalModelRuntimeConfig
+import com.proactiveai.extreme.core.edge.ModelDownloadPlan
+import com.proactiveai.extreme.core.edge.RemoteModelDownloader
 import com.proactiveai.extreme.core.model.EvaluationMetrics
 import com.proactiveai.extreme.core.model.PermissionDescriptor
 import com.proactiveai.extreme.core.model.PermissionGate
@@ -609,6 +611,58 @@ class PermissionCommandCenterState internal constructor(
 
     fun updateModelDownloadProgress(percent: Int) {
         modelDownloadProgress = percent
+    }
+
+    suspend fun downloadAndActivateModel(
+        profile: EdgeModelProfile,
+        downloadUrl: String,
+        huggingFaceToken: String,
+    ) {
+        val normalizedUrl = ModelDownloadPlan.normalizeUrl(profile, downloadUrl)
+        val normalizedToken = huggingFaceToken.trim()
+        val profileLabel = ModelDownloadPlan.shortLabelFor(profile)
+        persistHuggingFaceToken(normalizedToken)
+        modelDownloadProgress = 0
+        modelDownloadStatus = "Downloading $profileLabel LiteRT-LM model..."
+
+        val result = RemoteModelDownloader.downloadToAppStorage(
+            context = appContext,
+            url = normalizedUrl,
+            huggingFaceToken = normalizedToken.ifBlank { null },
+            preferredFileName = ModelDownloadPlan.preferredFileName(profile, normalizedUrl),
+            onProgress = { progress ->
+                modelDownloadProgress = progress.percent
+                modelDownloadStatus = if (progress.totalBytes > 0) {
+                    "Downloading $profileLabel LiteRT-LM model... ${progress.percent}%"
+                } else {
+                    "Downloading $profileLabel LiteRT-LM model..."
+                }
+            },
+        )
+
+        result.fold(
+            onSuccess = { path ->
+                persistLocalModelConfig(
+                    enabled = true,
+                    modelPath2B = if (profile == EdgeModelProfile.GEMMA_EFFECTIVE_2B) path else localModelPath2B,
+                    modelPath4B = if (profile == EdgeModelProfile.GEMMA_EFFECTIVE_4B) path else localModelPath4B,
+                    backendId = LocalModelBackend.LITERT_LM.id,
+                    ggufPath2B = localGgufPath2B,
+                    ggufPath4B = localGgufPath4B,
+                    llamaContextSize = localLlamaContextSize,
+                    llamaThreads = localLlamaThreads,
+                )
+                setEdgeModel(profile.id)
+                modelDownloadProgress = 100
+                modelDownloadStatus = "$profileLabel LiteRT-LM model ready: $path"
+                latestNativeModelStatus = "$profileLabel LiteRT-LM downloaded. Run Inference Test."
+                latestNativeModelOutput = ""
+            },
+            onFailure = { error ->
+                modelDownloadProgress = -1
+                modelDownloadStatus = "$profileLabel LiteRT-LM download failed: ${RemoteModelDownloader.describeFailure(error)}"
+            },
+        )
     }
 
     fun updateCurrentPlan(plan: ActionPlanPayload?) {
