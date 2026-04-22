@@ -498,6 +498,9 @@ fun PermissionCommandCenterScreen(
                 "sessionStartMs" to session.startMs,
                 "sessionEndMs" to session.endMs,
                 "eventCount" to row.eventCount,
+                "sparklingSession" to row.sparklingSession,
+                "sparklingSignalCount" to row.sparklingSignalCount,
+                "sparklingTriggers" to session.sparklingTriggers,
                 "speechSummary" to row.speechSummary,
                 "positionSummary" to row.positionSummary,
                 "indoorOutdoor" to row.indoorOutdoor,
@@ -800,6 +803,9 @@ fun PermissionCommandCenterScreen(
                         sessionId = session.sessionId,
                         sessionLabel = formatSessionRange(session.startMs, session.endMs),
                         eventCount = session.events.size,
+                        sparklingSession = session.isSparkling,
+                        sparklingSignalCount = session.sparklingSignalCount,
+                        sparklingTriggers = session.sparklingTriggers.joinToString(separator = ", ").ifBlank { "-" },
                         speechSummary = snapshot.speechSummary,
                         positionSummary = snapshot.positionSummary,
                         indoorOutdoor = snapshot.indoorOutdoor,
@@ -2368,6 +2374,7 @@ private fun SessionTableHeaderRow() {
     ) {
         SessionTableCell("Session", 120.dp, header = true)
         SessionTableCell("Events", 70.dp, header = true)
+        SessionTableCell("Sparkling", 140.dp, header = true)
         SessionTableCell("Speech", 210.dp, header = true)
         SessionTableCell("Position", 165.dp, header = true)
         SessionTableCell("Indoor/Outdoor", 120.dp, header = true)
@@ -2392,6 +2399,21 @@ private fun SessionTableDataRow(
         ) {
             SessionTableCell(row.sessionLabel, 120.dp)
             SessionTableCell(row.eventCount.toString(), 70.dp)
+            SessionTableCell(
+                text = if (row.sparklingSession) {
+                    buildString {
+                        append("YES (${row.sparklingSignalCount})")
+                        if (row.sparklingTriggers.isNotBlank() && row.sparklingTriggers != "-") {
+                            append("\n")
+                            append(row.sparklingTriggers)
+                        }
+                    }
+                } else {
+                    "-"
+                },
+                width = 140.dp,
+                maxLines = 4,
+            )
             SessionTableCell(
                 text = row.speechSummary,
                 width = 210.dp,
@@ -4224,6 +4246,9 @@ private data class FifteenMinuteSession(
     val startMs: Long,
     val endMs: Long,
     val events: List<ContextEventPayload>,
+    val sparklingSignalCount: Int,
+    val sparklingTriggers: List<String>,
+    val isSparkling: Boolean,
 )
 
 private data class FourHourDiaryRow(
@@ -4253,6 +4278,9 @@ private data class SessionContextSnapshot(
     val indoorOutdoor: String,
     val locationLabel: String,
     val calendarSummary: String,
+    val sparklingSession: Boolean,
+    val sparklingSignalCount: Int,
+    val sparklingTriggers: String,
 )
 
 private data class SessionInferenceParsed(
@@ -4851,11 +4879,20 @@ private fun buildFifteenMinuteSessions(
         .take(maxSessions)
         .map { (startMs, groupedEvents) ->
             val ordered = groupedEvents.sortedByDescending { it.occurredAt }
+            val sparklingSignals = ordered.filter { isSparklingSignal(it) }
+            val sparklingTriggers = sparklingSignals
+                .mapNotNull { extractSparklingTrigger(it) }
+                .distinct()
+                .take(4)
+            val sparklingSignalCount = sparklingSignals.size
             FifteenMinuteSession(
                 sessionId = "session_$startMs",
                 startMs = startMs,
                 endMs = startMs + ASSISTANT_SESSION_WINDOW_MS,
                 events = ordered,
+                sparklingSignalCount = sparklingSignalCount,
+                sparklingTriggers = sparklingTriggers,
+                isSparkling = sparklingSignalCount > 0,
             )
         }
 }
@@ -4874,6 +4911,8 @@ private fun buildSessionContextSnapshot(
     val wifiSignals = mutableListOf<Boolean>()
     val cellularSignals = mutableListOf<Boolean>()
     val calendarSignals = mutableListOf<String>()
+    var sparklingSignalCount = 0
+    val sparklingTriggers = mutableListOf<String>()
 
     ordered.forEach { event ->
         val sourceLower = event.source.lowercase(Locale.US)
@@ -4881,6 +4920,14 @@ private fun buildSessionContextSnapshot(
         val summaryLower = event.summary.lowercase(Locale.US)
 
         extractSpeechSignal(event)?.let { speechSignals += it }
+        if (isSparklingSignal(event)) {
+            sparklingSignalCount += 1
+            extractSparklingTrigger(event)?.let { trigger ->
+                if (trigger !in sparklingTriggers) {
+                    sparklingTriggers += trigger
+                }
+            }
+        }
 
         if (categoryLower == "location" || sourceLower.contains("location")) {
             if (latitude == null) {
@@ -4947,6 +4994,9 @@ private fun buildSessionContextSnapshot(
         indoorOutdoor = indoorOutdoor,
         locationLabel = locationLabel,
         calendarSummary = calendarSummary,
+        sparklingSession = sparklingSignalCount > 0,
+        sparklingSignalCount = sparklingSignalCount,
+        sparklingTriggers = sparklingTriggers.joinToString(separator = ", ").ifBlank { "-" },
     )
 }
 
@@ -5004,6 +5054,33 @@ private fun extractSpeechSignal(event: ContextEventPayload): SpeechSignal? {
         text = pickedText,
         priority = if (isCloudRefined) 2 else 1,
     )
+}
+
+private fun isSparklingSignal(event: ContextEventPayload): Boolean {
+    val categoryLower = event.category.lowercase(Locale.US)
+    val sourceLower = event.source.lowercase(Locale.US)
+    if (categoryLower == "sparkling" || sourceLower.contains("sparkling")) return true
+    if (payloadBoolean(event.payload, "sparkling") == true) return true
+    if (payloadBoolean(event.payload, "sparklingSessionHint") == true) return true
+    return false
+}
+
+private fun extractSparklingTrigger(event: ContextEventPayload): String? {
+    val raw = payloadString(event.payload, "trigger")
+        ?.lowercase(Locale.US)
+        ?.trim()
+    val normalized = when {
+        raw.isNullOrBlank() -> null
+        raw.contains("shake") -> "shake"
+        raw.contains("tap") -> "double_tap"
+        else -> raw.take(32)
+    }
+    if (!normalized.isNullOrBlank()) return normalized
+    return when {
+        event.summary.contains("shake", ignoreCase = true) -> "shake"
+        event.summary.contains("tap", ignoreCase = true) -> "double_tap"
+        else -> null
+    }
 }
 
 private fun buildSpeechSummaryFromSignals(
@@ -5090,6 +5167,7 @@ private fun buildAssistantPromptForSession(
 
         Session window: ${formatSessionRange(session.startMs, session.endMs)}
         Event count: ${session.events.size}
+        Sparkling marker: ${if (snapshot.sparklingSession) "YES (${snapshot.sparklingSignalCount}, triggers=${snapshot.sparklingTriggers})" else "NO"}
         Speech: ${snapshot.speechSummary}
         Position: ${snapshot.positionSummary}
         Indoor/Outdoor: ${snapshot.indoorOutdoor}
@@ -5206,6 +5284,10 @@ private fun buildHeuristicScenarioGuess(
     }
 
     val activity = when {
+        session.isSparkling && hasSpeech ->
+            "User intentionally marked a sparkling moment while speaking and expects immediate help"
+        session.isSparkling ->
+            "User intentionally marked this as a high-value moment and expects focused proactive support"
         motionState == "driving" || motionState == "walking" ->
             "User is likely commuting or moving between locations"
         calendarSignals > 0 && hasSpeech ->
@@ -5239,6 +5321,7 @@ private fun buildHeuristicScenarioGuess(
     }
 
     val evidence = buildList {
+        if (session.isSparkling) add("sparkling_marker=${session.sparklingTriggers.joinToString(",").ifBlank { "manual" }}")
         if (calendarSignals > 0) add("calendar/task signals=$calendarSignals")
         if (commSignals > 0) add("communication signals=$commSignals")
         if (motionState != "unknown") add("motion=$motionState")
@@ -5246,13 +5329,17 @@ private fun buildHeuristicScenarioGuess(
         if (hasSpeech) add("speech=\"${snapshot.speechSummary.take(70)}\"")
     }.ifEmpty { listOf("limited context signals") }
 
-    val confidence = (45 + evidence.size * 10 + minOf(3, workloadScore) * 5).coerceIn(35, 92)
+    val sparklingBoost = if (session.isSparkling) 16 else 0
+    val confidence = (45 + evidence.size * 10 + minOf(3, workloadScore) * 5 + sparklingBoost).coerceIn(35, 96)
     val scenario = buildString {
         append("$activity; workload=$workload; mood=$mood; confidence=$confidence%. ")
         append("Evidence: ${evidence.joinToString(", ")}.")
     }.take(220)
 
     val actions = mutableListOf<String>()
+    if (session.isSparkling) {
+        actions += "Capture this sparkling moment as a priority note with one concrete next action and deadline."
+    }
     val milkTeaIntent = containsAny(speechLower, listOf("奶茶", "milk tea", "bubble tea", "boba", "茶饮"))
     if (milkTeaIntent) {
         actions += "Find top nearby milk tea shops by ETA and rating, then show direct order/search links."

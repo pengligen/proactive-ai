@@ -118,6 +118,9 @@ object AssistantSessionAutoRunner {
                     "sessionStartMs" to sessionStartMs,
                     "sessionEndMs" to sessionEndMs,
                     "eventCount" to sessionEvents.size,
+                    "sparklingSession" to (snapshot.sparklingSignalCount > 0),
+                    "sparklingSignalCount" to snapshot.sparklingSignalCount,
+                    "sparklingTriggers" to snapshot.sparklingTriggers,
                     "speechSummary" to snapshot.speechSummary,
                     "positionSummary" to snapshot.positionSummary,
                     "indoorOutdoor" to snapshot.indoorOutdoor,
@@ -188,6 +191,8 @@ object AssistantSessionAutoRunner {
         val indoorOutdoor: String,
         val locationLabel: String,
         val calendarSummary: String,
+        val sparklingSignalCount: Int,
+        val sparklingTriggers: List<String>,
     )
 
     private data class SpeechSignal(
@@ -216,6 +221,8 @@ object AssistantSessionAutoRunner {
         val wifiSignals = mutableListOf<Boolean>()
         val cellularSignals = mutableListOf<Boolean>()
         val calendarSignals = mutableListOf<String>()
+        var sparklingSignalCount = 0
+        val sparklingTriggers = mutableListOf<String>()
 
         events.forEach { event ->
             val sourceLower = event.source.lowercase(Locale.US)
@@ -223,6 +230,14 @@ object AssistantSessionAutoRunner {
             val summaryLower = event.summary.lowercase(Locale.US)
 
             extractSpeechSignal(event)?.let { speechSignals += it }
+            if (isSparklingSignal(event)) {
+                sparklingSignalCount += 1
+                extractSparklingTrigger(event)?.let { trigger ->
+                    if (trigger !in sparklingTriggers) {
+                        sparklingTriggers += trigger
+                    }
+                }
+            }
 
             if (categoryLower == "location" || sourceLower.contains("location")) {
                 if (latitude == null) latitude = payloadDouble(event.payload, "latitude")
@@ -284,7 +299,36 @@ object AssistantSessionAutoRunner {
             indoorOutdoor = indoorOutdoor,
             locationLabel = locationLabel,
             calendarSummary = calendarSummary,
+            sparklingSignalCount = sparklingSignalCount,
+            sparklingTriggers = sparklingTriggers.take(4),
         )
+    }
+
+    private fun isSparklingSignal(event: ContextEventPayload): Boolean {
+        val categoryLower = event.category.lowercase(Locale.US)
+        val sourceLower = event.source.lowercase(Locale.US)
+        if (categoryLower == "sparkling" || sourceLower.contains("sparkling")) return true
+        if (payloadBoolean(event.payload, "sparkling") == true) return true
+        if (payloadBoolean(event.payload, "sparklingSessionHint") == true) return true
+        return false
+    }
+
+    private fun extractSparklingTrigger(event: ContextEventPayload): String? {
+        val raw = payloadString(event.payload, "trigger")
+            ?.lowercase(Locale.US)
+            ?.trim()
+        val normalized = when {
+            raw.isNullOrBlank() -> null
+            raw.contains("shake") -> "shake"
+            raw.contains("tap") -> "double_tap"
+            else -> raw.take(32)
+        }
+        if (!normalized.isNullOrBlank()) return normalized
+        return when {
+            event.summary.contains("shake", ignoreCase = true) -> "shake"
+            event.summary.contains("tap", ignoreCase = true) -> "double_tap"
+            else -> null
+        }
     }
 
     private fun extractSpeechSignal(event: ContextEventPayload): SpeechSignal? {
@@ -414,6 +458,7 @@ object AssistantSessionAutoRunner {
 
             Session window: ${formatSessionRange(startMs, endMs)}
             Event count: $eventCount
+            Sparkling marker: ${if (snapshot.sparklingSignalCount > 0) "YES (${snapshot.sparklingSignalCount}, triggers=${snapshot.sparklingTriggers.joinToString(", ").ifBlank { "manual" }})" else "NO"}
             Speech: ${snapshot.speechSummary}
             Position: ${snapshot.positionSummary}
             Indoor/Outdoor: ${snapshot.indoorOutdoor}
@@ -522,6 +567,10 @@ object AssistantSessionAutoRunner {
         }
 
         val activity = when {
+            snapshot.sparklingSignalCount > 0 && hasSpeech ->
+                "User intentionally marked a sparkling moment while speaking and expects immediate help"
+            snapshot.sparklingSignalCount > 0 ->
+                "User intentionally marked this as a high-value moment and expects focused proactive support"
             motionState == "driving" || motionState == "walking" ->
                 "User is likely commuting or moving between locations"
             calendarSignals > 0 && hasSpeech ->
@@ -554,6 +603,9 @@ object AssistantSessionAutoRunner {
         }
 
         val evidence = buildList {
+            if (snapshot.sparklingSignalCount > 0) {
+                add("sparkling_marker=${snapshot.sparklingTriggers.joinToString(",").ifBlank { "manual" }}")
+            }
             if (calendarSignals > 0) add("calendar/task signals=$calendarSignals")
             if (commSignals > 0) add("communication signals=$commSignals")
             if (motionState != "unknown") add("motion=$motionState")
@@ -561,13 +613,17 @@ object AssistantSessionAutoRunner {
             if (hasSpeech) add("speech=\"${snapshot.speechSummary.take(70)}\"")
         }.ifEmpty { listOf("limited context signals") }
 
-        val confidence = (45 + evidence.size * 10 + minOf(3, workloadScore) * 5).coerceIn(35, 92)
+        val sparklingBoost = if (snapshot.sparklingSignalCount > 0) 16 else 0
+        val confidence = (45 + evidence.size * 10 + minOf(3, workloadScore) * 5 + sparklingBoost).coerceIn(35, 96)
         val scenario = buildString {
             append("$activity; workload=$workload; mood=$mood; confidence=$confidence%. ")
             append("Evidence: ${evidence.joinToString(", ")}.")
         }.take(220)
 
         val actions = mutableListOf<String>()
+        if (snapshot.sparklingSignalCount > 0) {
+            actions += "Capture this sparkling moment as a priority note with one concrete next action and deadline."
+        }
         val milkTeaIntent = containsAny(speechLower, listOf("奶茶", "milk tea", "bubble tea", "boba", "茶饮"))
         if (milkTeaIntent) {
             actions += "Find top nearby milk tea shops by ETA and rating, then show direct order/search links."

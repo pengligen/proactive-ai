@@ -173,6 +173,9 @@ data class AssistantSessionRowUiState(
     val sessionId: String,
     val sessionLabel: String,
     val eventCount: Int,
+    val sparklingSession: Boolean,
+    val sparklingSignalCount: Int,
+    val sparklingTriggers: String,
     val speechSummary: String,
     val positionSummary: String,
     val indoorOutdoor: String,
@@ -1587,6 +1590,16 @@ class PermissionCommandCenterState internal constructor(
                     persistedSpeech.isNotBlank() -> persistedSpeech
                     else -> ASSISTANT_NO_SPEECH_TEXT
                 }
+                val sparklingSignalCount = valueAsInt(payload["sparklingSignalCount"]) ?: 0
+                val sparklingTriggerValues = valueAsStringList(payload["sparklingTriggers"])
+                val sparklingSession = valueAsBoolean(payload["sparklingSession"]) == true ||
+                    valueAsBoolean(payload["sparkling"]) == true ||
+                    sparklingSignalCount > 0 ||
+                    sparklingTriggerValues.isNotEmpty()
+                val sparklingTriggers = sparklingTriggerValues
+                    .take(4)
+                    .joinToString(separator = ", ")
+                    .ifBlank { if (sparklingSession) "manual marker" else "-" }
                 val positionSummary = payload["positionSummary"]?.toString().orEmpty()
                 val indoorOutdoor = payload["indoorOutdoor"]?.toString().orEmpty()
                 val locationLabel = payload["locationLabel"]?.toString().orEmpty()
@@ -1608,6 +1621,9 @@ class PermissionCommandCenterState internal constructor(
                         sessionId = sessionId,
                         sessionLabel = sessionLabel,
                         eventCount = payload["eventCount"].toString().toIntOrNull() ?: 0,
+                        sparklingSession = sparklingSession,
+                        sparklingSignalCount = sparklingSignalCount,
+                        sparklingTriggers = sparklingTriggers,
                         speechSummary = speechSummary,
                         positionSummary = positionSummary,
                         indoorOutdoor = indoorOutdoor,
@@ -2137,6 +2153,14 @@ class PermissionCommandCenterState internal constructor(
         }
     }
 
+    private fun valueAsInt(value: Any?): Int? {
+        return when (value) {
+            is Number -> value.toInt()
+            is String -> value.toIntOrNull()
+            else -> null
+        }
+    }
+
     private fun valueAsBoolean(value: Any?): Boolean? {
         return when (value) {
             is Boolean -> value
@@ -2149,6 +2173,17 @@ class PermissionCommandCenterState internal constructor(
                 }
             }
             else -> null
+        }
+    }
+
+    private fun valueAsStringList(value: Any?): List<String> {
+        return when (value) {
+            is List<*> -> value.mapNotNull { item -> valueAsString(item) }.filter { it.isNotBlank() }
+            is String -> value
+                .split(",", "|")
+                .map { it.trim().trimStart('[', ']').trimEnd('[', ']') }
+                .filter { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+            else -> emptyList()
         }
     }
 
