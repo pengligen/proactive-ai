@@ -46,13 +46,16 @@ class MainActivity : ComponentActivity() {
 
         lifecycleScope.launch(Dispatchers.IO) {
             val runtime = LiteRtLmRuntime.getInstance(this@MainActivity)
+            val selectedProfile = EdgeModelProfile.fromId(AppPrefs.getEdgeModel(this@MainActivity))
+            val pathMap = AppPrefs.getLocalModelPathMap(this@MainActivity)
             val config = LocalModelRuntimeConfig(
                 enabled = true,
                 backend = LocalModelBackend.LITERT_LM,
-                modelPath2B = AppPrefs.getLocalModelPath2B(this@MainActivity),
-                modelPath4B = AppPrefs.getLocalModelPath4B(this@MainActivity),
-                ggufPath2B = AppPrefs.getLocalGgufPath2B(this@MainActivity),
-                ggufPath4B = AppPrefs.getLocalGgufPath4B(this@MainActivity),
+                modelPathById = pathMap,
+                ggufPathById = mapOf(
+                    EdgeModelProfile.GEMMA_EFFECTIVE_2B.id to AppPrefs.getLocalGgufPath2B(this@MainActivity),
+                    EdgeModelProfile.GEMMA_EFFECTIVE_4B.id to AppPrefs.getLocalGgufPath4B(this@MainActivity),
+                ),
                 maxTokens = 48,
                 topK = 40,
                 temperature = 0.7f,
@@ -61,7 +64,7 @@ class MainActivity : ComponentActivity() {
             )
 
             val result = runtime.generate(
-                profile = EdgeModelProfile.GEMMA_EFFECTIVE_2B,
+                profile = selectedProfile,
                 prompt = "Reply with one short sentence saying hello from local LiteRT-LM on Android.",
                 config = config,
             )

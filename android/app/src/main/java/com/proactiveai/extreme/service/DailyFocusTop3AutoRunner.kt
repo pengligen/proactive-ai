@@ -80,13 +80,15 @@ object DailyFocusTop3AutoRunner {
         if (events.isEmpty()) return false
 
         val model = EdgeModelProfile.fromId(AppPrefs.getEdgeModel(context))
+        val pathMap = AppPrefs.getLocalModelPathMap(context)
         val runtimeConfig = LocalModelRuntimeConfig(
             enabled = AppPrefs.isLocalModelEnabled(context),
             backend = LocalModelBackend.fromId(AppPrefs.getLocalModelBackend(context)),
-            modelPath2B = AppPrefs.getLocalModelPath2B(context),
-            modelPath4B = AppPrefs.getLocalModelPath4B(context),
-            ggufPath2B = AppPrefs.getLocalGgufPath2B(context),
-            ggufPath4B = AppPrefs.getLocalGgufPath4B(context),
+            modelPathById = pathMap,
+            ggufPathById = mapOf(
+                EdgeModelProfile.GEMMA_EFFECTIVE_2B.id to AppPrefs.getLocalGgufPath2B(context),
+                EdgeModelProfile.GEMMA_EFFECTIVE_4B.id to AppPrefs.getLocalGgufPath4B(context),
+            ),
             llamaContextSize = AppPrefs.getLocalLlamaContextSize(context),
             llamaThreads = AppPrefs.getLocalLlamaThreads(context),
         )

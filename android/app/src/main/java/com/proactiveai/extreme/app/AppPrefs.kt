@@ -5,6 +5,8 @@ import com.proactiveai.extreme.core.edge.EdgeModelProfile
 import com.proactiveai.extreme.core.edge.LocalModelBackend
 import com.proactiveai.extreme.core.model.EvaluationMetrics
 import com.proactiveai.extreme.data.ExtremeDefaults
+import org.json.JSONObject
+import java.io.File
 
 object AppPrefs {
     private const val PREFS_NAME = "proactive_extreme_prefs"
@@ -17,6 +19,7 @@ object AppPrefs {
     private const val KEY_AUTO_EXECUTE_LOW_RISK = "auto_execute_low_risk"
     private const val KEY_LOCAL_MODEL_ENABLED = "local_model_enabled"
     private const val KEY_LOCAL_MODEL_BACKEND = "local_model_backend"
+    private const val KEY_LOCAL_MODEL_PATH_MAP_JSON = "local_model_path_map_json"
     private const val KEY_LOCAL_MODEL_PATH_2B = "local_model_path_2b"
     private const val KEY_LOCAL_MODEL_PATH_4B = "local_model_path_4b"
     private const val KEY_LOCAL_GGUF_PATH_2B = "local_gguf_path_2b"
@@ -96,8 +99,8 @@ object AppPrefs {
     }
 
     fun getEdgeModel(context: Context): String {
-        return prefs(context).getString(KEY_EDGE_MODEL, EdgeModelProfile.GEMMA_EFFECTIVE_2B.id)
-            ?: EdgeModelProfile.GEMMA_EFFECTIVE_2B.id
+        return prefs(context).getString(KEY_EDGE_MODEL, EdgeModelProfile.default.id)
+            ?: EdgeModelProfile.default.id
     }
 
     fun setEdgeModel(context: Context, modelId: String) {
@@ -129,26 +132,97 @@ object AppPrefs {
         prefs(context).edit().putString(KEY_LOCAL_MODEL_BACKEND, backendId).apply()
     }
 
+    fun getLocalModelPathMap(context: Context): Map<String, String> {
+        val defaults = EdgeModelProfile.entries.associate { profile ->
+            profile.id to defaultModelPath(context, profile)
+        }.toMutableMap()
+        val merged = defaults.toMutableMap()
+
+        // Backward-compat: import legacy dedicated slots if present.
+        val legacy2B = prefs(context).getString(KEY_LOCAL_MODEL_PATH_2B, null)?.trim().orEmpty()
+        if (legacy2B.isNotBlank()) {
+            merged[EdgeModelProfile.GEMMA_EFFECTIVE_2B.id] = legacy2B
+        }
+        val legacy4B = prefs(context).getString(KEY_LOCAL_MODEL_PATH_4B, null)?.trim().orEmpty()
+        if (legacy4B.isNotBlank()) {
+            merged[EdgeModelProfile.GEMMA_EFFECTIVE_4B.id] = legacy4B
+        }
+
+        val rawJson = prefs(context).getString(KEY_LOCAL_MODEL_PATH_MAP_JSON, null).orEmpty()
+        if (rawJson.isNotBlank()) {
+            runCatching {
+                val obj = JSONObject(rawJson)
+                obj.keys().forEach { key ->
+                    val value = obj.optString(key, "").trim()
+                    if (value.isNotBlank()) {
+                        merged[key] = value
+                    }
+                }
+            }
+        }
+
+        return merged
+    }
+
+    fun setLocalModelPathMap(
+        context: Context,
+        pathMap: Map<String, String>,
+    ) {
+        val normalized = EdgeModelProfile.entries.associate { profile ->
+            val raw = pathMap[profile.id]?.trim().orEmpty()
+            profile.id to raw.ifBlank { defaultModelPath(context, profile) }
+        }
+        val json = JSONObject()
+        normalized.entries
+            .sortedBy { it.key }
+            .forEach { (key, value) -> json.put(key, value) }
+
+        prefs(context).edit()
+            .putString(KEY_LOCAL_MODEL_PATH_MAP_JSON, json.toString())
+            .apply()
+
+        // Keep legacy keys in sync for compatibility with older builds.
+        val legacy2B = normalized[EdgeModelProfile.GEMMA_EFFECTIVE_2B.id].orEmpty()
+        val legacy4B = normalized[EdgeModelProfile.GEMMA_EFFECTIVE_4B.id].orEmpty()
+        prefs(context).edit()
+            .putString(KEY_LOCAL_MODEL_PATH_2B, legacy2B)
+            .putString(KEY_LOCAL_MODEL_PATH_4B, legacy4B)
+            .apply()
+    }
+
+    fun getLocalModelPath(
+        context: Context,
+        profile: EdgeModelProfile,
+    ): String {
+        return getLocalModelPathMap(context)[profile.id]
+            ?.takeIf { it.isNotBlank() }
+            ?: defaultModelPath(context, profile)
+    }
+
+    fun setLocalModelPath(
+        context: Context,
+        profile: EdgeModelProfile,
+        path: String,
+    ) {
+        val updated = getLocalModelPathMap(context).toMutableMap()
+        updated[profile.id] = path.trim()
+        setLocalModelPathMap(context, updated)
+    }
+
     fun getLocalModelPath2B(context: Context): String {
-        return prefs(context).getString(
-            KEY_LOCAL_MODEL_PATH_2B,
-            "/data/user/0/com.proactiveai.extreme/files/models/gemma-4-E2B-it.litertlm",
-        ) ?: "/data/user/0/com.proactiveai.extreme/files/models/gemma-4-E2B-it.litertlm"
+        return getLocalModelPath(context, EdgeModelProfile.GEMMA_EFFECTIVE_2B)
     }
 
     fun setLocalModelPath2B(context: Context, path: String) {
-        prefs(context).edit().putString(KEY_LOCAL_MODEL_PATH_2B, path).apply()
+        setLocalModelPath(context, EdgeModelProfile.GEMMA_EFFECTIVE_2B, path)
     }
 
     fun getLocalModelPath4B(context: Context): String {
-        return prefs(context).getString(
-            KEY_LOCAL_MODEL_PATH_4B,
-            "/data/user/0/com.proactiveai.extreme/files/models/gemma-4-E4B-it.litertlm",
-        ) ?: "/data/user/0/com.proactiveai.extreme/files/models/gemma-4-E4B-it.litertlm"
+        return getLocalModelPath(context, EdgeModelProfile.GEMMA_EFFECTIVE_4B)
     }
 
     fun setLocalModelPath4B(context: Context, path: String) {
-        prefs(context).edit().putString(KEY_LOCAL_MODEL_PATH_4B, path).apply()
+        setLocalModelPath(context, EdgeModelProfile.GEMMA_EFFECTIVE_4B, path)
     }
 
     fun getLocalGgufPath2B(context: Context): String {
@@ -334,6 +408,14 @@ object AppPrefs {
             .remove(KEY_METRIC_INTERRUPTION_TOTAL)
             .remove(KEY_METRIC_INTERRUPTION_POSITIVE)
             .apply()
+    }
+
+    private fun defaultModelPath(
+        context: Context,
+        profile: EdgeModelProfile,
+    ): String {
+        val dir = File(context.filesDir, "models")
+        return File(dir, profile.defaultLiteRtFileName).absolutePath
     }
 
     private fun bumpCounter(context: Context, key: String) {

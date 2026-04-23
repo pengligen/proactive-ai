@@ -28,8 +28,10 @@ object ItemDerivationEngine {
     private fun assistantSessionItem(event: ContextEvent): MobileSyncItem? {
         val sessionId = stringValue(event.payload["sessionId"]).ifBlank { return null }
         val sessionLabel = stringValue(event.payload["sessionLabel"]).ifBlank { "Assistant session" }
-        val scenario = stringValue(event.payload["guessedUserScenario"])
-        val actionPlan = stringValue(event.payload["actionPlan"])
+        val scenario = stringValue(event.payload["cloudGuessedUserScenario"])
+            .ifBlank { stringValue(event.payload["guessedUserScenario"]) }
+        val actionPlan = stringValue(event.payload["cloudActionPlan"])
+            .ifBlank { stringValue(event.payload["actionPlan"]) }
         val summary = listOf(scenario, actionPlan)
             .filter { it.isNotBlank() }
             .joinToString(" | ")
@@ -50,7 +52,8 @@ object ItemDerivationEngine {
 
     private fun assistantMomentItem(event: ContextEvent): MobileSyncItem? {
         val sessionId = stringValue(event.payload["sessionId"]).ifBlank { return null }
-        val scenario = stringValue(event.payload["guessedUserScenario"])
+        val scenario = stringValue(event.payload["cloudGuessedUserScenario"])
+            .ifBlank { stringValue(event.payload["guessedUserScenario"]) }
             .ifBlank { stringValue(event.payload["suggestion"]) }
             .ifBlank { event.summary }
             .takeIf { it.isNotBlank() }

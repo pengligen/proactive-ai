@@ -18,6 +18,7 @@ import com.proactiveai.extreme.core.context.Sensitivity
 import com.proactiveai.extreme.core.context.plugins.AudioAmbientPlugin
 import com.proactiveai.extreme.core.edge.EdgeInferenceResult
 import com.proactiveai.extreme.core.edge.EdgeModelProfile
+import com.proactiveai.extreme.core.edge.LocalModelStorageManager
 import com.proactiveai.extreme.core.edge.LocalModelBackend
 import com.proactiveai.extreme.core.edge.LocalModelRuntimeConfig
 import com.proactiveai.extreme.core.edge.ModelDownloadPlan
@@ -44,6 +45,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
 
 private const val UI_STITCH_GAP_RESET_MS = 9_000L
 private const val UI_MAX_STITCH_CHARS = 1_400
@@ -52,6 +54,8 @@ private const val MANUAL_INTAKE_CLOUD_REFINE_TIMEOUT_MS = 45_000L
 private const val ASSISTANT_SESSION_WINDOW_MS = 15 * 60 * 1000L
 private const val ASSISTANT_SPEECH_MAX_CHARS = 12_000
 private const val ASSISTANT_NO_SPEECH_TEXT = "No speech transcript in this session"
+private const val ASSISTANT_SESSION_FUTURE_TOLERANCE_MS = 10 * 60 * 1000L
+private const val LOCATION_FALLBACK_LOOKBACK_MS = 12 * 60 * 60 * 1000L
 
 data class PermissionUiState(
     val id: String,
@@ -104,6 +108,7 @@ data class ContextLogUiState(
     val id: Long,
     val timestampLabel: String,
     val summary: String,
+    val detail: String,
     val synced: Boolean,
 )
 
@@ -126,6 +131,12 @@ data class ModelInteractionUiState(
     val response: String,
     val status: String,
     val synced: Boolean,
+)
+
+private data class ModelInteractionSortable(
+    val occurredAt: Long,
+    val dedupeKey: String,
+    val item: ModelInteractionUiState,
 )
 
 data class AudioClipDebugUiState(
@@ -183,6 +194,11 @@ data class AssistantSessionRowUiState(
     val calendarSummary: String,
     val guessedUserScenario: String,
     val actionPlan: String,
+    val cloudGuessedUserScenario: String = "",
+    val cloudActionPlan: String = "",
+    val cloudComparison: String = "",
+    val cloudModelLabel: String = "",
+    val cloudStatus: String = "",
     val quickActions: List<AssistantQuickAction>,
     val modelLabel: String,
 )
@@ -319,6 +335,9 @@ class PermissionCommandCenterState internal constructor(
     var localModelEnabled by mutableStateOf(AppPrefs.isLocalModelEnabled(appContext))
         private set
 
+    private val _localModelPathMap = mutableStateMapOf<String, String>()
+    val localModelPathMap: Map<String, String> get() = _localModelPathMap
+
     var localModelPath2B by mutableStateOf(AppPrefs.getLocalModelPath2B(appContext))
         private set
 
@@ -435,6 +454,12 @@ class PermissionCommandCenterState internal constructor(
 
     val edgeModelOptions: List<EdgeModelProfile> = EdgeModelProfile.entries
 
+    val modelStorageDirPath: String
+        get() = File(appContext.filesDir, "models").absolutePath
+
+    val modelInferenceLogPath: String
+        get() = File(File(appContext.filesDir, "model_logs"), "inference_log.jsonl").absolutePath
+
     val readinessScore: Int
         get() {
             val total = plugins.sumOf { it.permissions.size }
@@ -456,8 +481,11 @@ class PermissionCommandCenterState internal constructor(
         autoExecuteLowRisk = AppPrefs.isAutoExecuteLowRisk(appContext)
         edgeModelId = AppPrefs.getEdgeModel(appContext)
         localModelEnabled = AppPrefs.isLocalModelEnabled(appContext)
-        localModelPath2B = AppPrefs.getLocalModelPath2B(appContext)
-        localModelPath4B = AppPrefs.getLocalModelPath4B(appContext)
+        val localPathMap = AppPrefs.getLocalModelPathMap(appContext)
+        _localModelPathMap.clear()
+        _localModelPathMap.putAll(localPathMap)
+        localModelPath2B = localPathMap[EdgeModelProfile.GEMMA_EFFECTIVE_2B.id].orEmpty()
+        localModelPath4B = localPathMap[EdgeModelProfile.GEMMA_EFFECTIVE_4B.id].orEmpty()
         localModelBackendId = AppPrefs.getLocalModelBackend(appContext)
         localGgufPath2B = AppPrefs.getLocalGgufPath2B(appContext)
         localGgufPath4B = AppPrefs.getLocalGgufPath4B(appContext)
@@ -534,9 +562,52 @@ class PermissionCommandCenterState internal constructor(
         edgeModelId = modelId
     }
 
+    fun localModelPathFor(profile: EdgeModelProfile): String {
+        return _localModelPathMap[profile.id].orEmpty()
+    }
+
+    fun localModelInstalled(profile: EdgeModelProfile): Boolean {
+        val path = localModelPathFor(profile).trim()
+        return path.isNotBlank() && File(path).exists()
+    }
+
     fun persistAutoExecuteLowRisk(enabled: Boolean) {
         AppPrefs.setAutoExecuteLowRisk(appContext, enabled)
         autoExecuteLowRisk = enabled
+    }
+
+    fun persistLocalModelConfig(
+        enabled: Boolean,
+        modelPathMap: Map<String, String>,
+        backendId: String = localModelBackendId,
+        ggufPath2B: String = localGgufPath2B,
+        ggufPath4B: String = localGgufPath4B,
+        llamaContextSize: Int = localLlamaContextSize,
+        llamaThreads: Int = localLlamaThreads,
+    ) {
+        val normalizedMap = EdgeModelProfile.entries.associate { profile ->
+            val incoming = modelPathMap[profile.id].orEmpty().trim()
+            val fallback = _localModelPathMap[profile.id].orEmpty().trim()
+            profile.id to incoming.ifBlank { fallback }
+        }
+
+        AppPrefs.setLocalModelEnabled(appContext, enabled)
+        AppPrefs.setLocalModelPathMap(appContext, normalizedMap)
+        AppPrefs.setLocalModelBackend(appContext, backendId)
+        AppPrefs.setLocalGgufPath2B(appContext, ggufPath2B)
+        AppPrefs.setLocalGgufPath4B(appContext, ggufPath4B)
+        AppPrefs.setLocalLlamaContextSize(appContext, llamaContextSize)
+        AppPrefs.setLocalLlamaThreads(appContext, llamaThreads)
+        localModelEnabled = enabled
+        _localModelPathMap.clear()
+        _localModelPathMap.putAll(AppPrefs.getLocalModelPathMap(appContext))
+        localModelPath2B = _localModelPathMap[EdgeModelProfile.GEMMA_EFFECTIVE_2B.id].orEmpty()
+        localModelPath4B = _localModelPathMap[EdgeModelProfile.GEMMA_EFFECTIVE_4B.id].orEmpty()
+        localModelBackendId = backendId
+        localGgufPath2B = ggufPath2B
+        localGgufPath4B = ggufPath4B
+        localLlamaContextSize = llamaContextSize
+        localLlamaThreads = llamaThreads
     }
 
     fun persistLocalModelConfig(
@@ -549,22 +620,20 @@ class PermissionCommandCenterState internal constructor(
         llamaContextSize: Int = localLlamaContextSize,
         llamaThreads: Int = localLlamaThreads,
     ) {
-        AppPrefs.setLocalModelEnabled(appContext, enabled)
-        AppPrefs.setLocalModelPath2B(appContext, modelPath2B)
-        AppPrefs.setLocalModelPath4B(appContext, modelPath4B)
-        AppPrefs.setLocalModelBackend(appContext, backendId)
-        AppPrefs.setLocalGgufPath2B(appContext, ggufPath2B)
-        AppPrefs.setLocalGgufPath4B(appContext, ggufPath4B)
-        AppPrefs.setLocalLlamaContextSize(appContext, llamaContextSize)
-        AppPrefs.setLocalLlamaThreads(appContext, llamaThreads)
-        localModelEnabled = enabled
-        localModelPath2B = modelPath2B
-        localModelPath4B = modelPath4B
-        localModelBackendId = backendId
-        localGgufPath2B = ggufPath2B
-        localGgufPath4B = ggufPath4B
-        localLlamaContextSize = llamaContextSize
-        localLlamaThreads = llamaThreads
+        val merged = _localModelPathMap.toMutableMap().ifEmpty {
+            AppPrefs.getLocalModelPathMap(appContext).toMutableMap()
+        }
+        merged[EdgeModelProfile.GEMMA_EFFECTIVE_2B.id] = modelPath2B.trim()
+        merged[EdgeModelProfile.GEMMA_EFFECTIVE_4B.id] = modelPath4B.trim()
+        persistLocalModelConfig(
+            enabled = enabled,
+            modelPathMap = merged,
+            backendId = backendId,
+            ggufPath2B = ggufPath2B,
+            ggufPath4B = ggufPath4B,
+            llamaContextSize = llamaContextSize,
+            llamaThreads = llamaThreads,
+        )
     }
 
     fun persistHuggingFaceToken(token: String) {
@@ -599,10 +668,11 @@ class PermissionCommandCenterState internal constructor(
         return LocalModelRuntimeConfig(
             enabled = localModelEnabled,
             backend = LocalModelBackend.fromId(localModelBackendId),
-            modelPath2B = localModelPath2B,
-            modelPath4B = localModelPath4B,
-            ggufPath2B = localGgufPath2B,
-            ggufPath4B = localGgufPath4B,
+            modelPathById = localModelPathMap.toMap(),
+            ggufPathById = mapOf(
+                EdgeModelProfile.GEMMA_EFFECTIVE_2B.id to localGgufPath2B,
+                EdgeModelProfile.GEMMA_EFFECTIVE_4B.id to localGgufPath4B,
+            ),
             llamaContextSize = localLlamaContextSize,
             llamaThreads = localLlamaThreads,
         )
@@ -645,15 +715,24 @@ class PermissionCommandCenterState internal constructor(
 
         result.fold(
             onSuccess = { path ->
+                val updatedMap = localModelPathMap.toMutableMap().ifEmpty {
+                    AppPrefs.getLocalModelPathMap(appContext).toMutableMap()
+                }
+                updatedMap[profile.id] = path
                 persistLocalModelConfig(
                     enabled = true,
-                    modelPath2B = if (profile == EdgeModelProfile.GEMMA_EFFECTIVE_2B) path else localModelPath2B,
-                    modelPath4B = if (profile == EdgeModelProfile.GEMMA_EFFECTIVE_4B) path else localModelPath4B,
+                    modelPathMap = updatedMap,
                     backendId = LocalModelBackend.LITERT_LM.id,
                     ggufPath2B = localGgufPath2B,
                     ggufPath4B = localGgufPath4B,
                     llamaContextSize = localLlamaContextSize,
                     llamaThreads = localLlamaThreads,
+                )
+                LocalModelStorageManager.upsertDownloadedModel(
+                    context = appContext,
+                    profile = profile,
+                    path = path,
+                    sourceUrl = normalizedUrl,
                 )
                 setEdgeModel(profile.id)
                 modelDownloadProgress = 100
@@ -894,10 +973,15 @@ class PermissionCommandCenterState internal constructor(
         _contextLogs.clear()
         _contextLogs.addAll(
             rows.map { row ->
+                val payload = safePayloadMap(row.payloadJson)
                 ContextLogUiState(
                     id = row.id,
                     timestampLabel = formatTime(row.occurredAt),
-                    summary = row.summary,
+                    summary = row.summary.lineSequence().firstOrNull().orEmpty().ifBlank { row.summary }.take(280),
+                    detail = buildContextLogDetail(
+                        payload = payload,
+                        summary = row.summary,
+                    ),
                     synced = row.synced,
                 )
             }
@@ -976,35 +1060,105 @@ class PermissionCommandCenterState internal constructor(
     }
 
     fun refreshModelInteractions(limit: Int = 120) {
-        val rows = ContextEventStore.getInstance(appContext)
-            .getRecent(limit = 800)
-            .filter { it.category == "model_io" }
+        val storeRows = ContextEventStore.getInstance(appContext)
+            .getRecent(limit = 1600)
+            .filter { row ->
+                row.category.equals("model_io", ignoreCase = true) ||
+                    row.category.contains("model", ignoreCase = true) ||
+                    row.source.contains("model", ignoreCase = true)
+            }
+
+        val storeItems = storeRows.mapNotNull { row ->
+            val payload = safePayloadMap(row.payloadJson)
+            val prompt = valueAsString(payload["prompt"]).orEmpty()
+            val response = valueAsString(payload["response"]).orEmpty()
+            val trigger = valueAsString(payload["trigger"]).orEmpty().ifBlank { "unknown" }
+            val mode = valueAsString(payload["mode"]).orEmpty()
+            val modelLabel = valueAsString(payload["model"]).orEmpty().ifBlank { row.source }
+            val status = valueAsString(payload["nativeStatus"])
+                ?: valueAsString(payload["status"])
+                ?: row.summary
+            val nonEmpty = prompt.isNotBlank() || response.isNotBlank()
+            if (!nonEmpty) return@mapNotNull null
+
+            val dedupeKey = listOf(row.occurredAt.toString(), trigger, mode, prompt.take(120), response.take(120))
+                .joinToString("|")
+            ModelInteractionSortable(
+                occurredAt = row.occurredAt,
+                dedupeKey = dedupeKey,
+                item = ModelInteractionUiState(
+                    id = row.id,
+                    timestampLabel = formatTime(row.occurredAt),
+                    trigger = if (mode.isBlank()) trigger else "$trigger/$mode",
+                    modelLabel = modelLabel,
+                    prompt = prompt,
+                    response = response,
+                    status = status,
+                    synced = row.synced,
+                ),
+            )
+        }
+
+        val fileItems = loadModelInteractionLogItems(limit = limit * 3)
+        val merged = (storeItems + fileItems)
+            .sortedByDescending { it.occurredAt }
+            .distinctBy { it.dedupeKey }
             .take(limit)
 
         _modelInteractions.clear()
-        _modelInteractions.addAll(
-            rows.map { row ->
-                val payload = kotlin.runCatching { JSONObject(row.payloadJson).toMap() }.getOrNull().orEmpty()
-                val prompt = payload["prompt"]?.toString().orEmpty()
-                val response = payload["response"]?.toString().orEmpty()
-                ModelInteractionUiState(
-                    id = row.id,
-                    timestampLabel = formatTime(row.occurredAt),
-                    trigger = payload["trigger"]?.toString().orEmpty().ifBlank { "unknown" },
-                    modelLabel = payload["model"]?.toString().orEmpty().ifBlank { row.source },
-                    prompt = prompt,
-                    response = response,
-                    status = payload["nativeStatus"]?.toString().orEmpty().ifBlank { row.summary },
-                    synced = row.synced,
-                )
-            }
-        )
+        _modelInteractions.addAll(merged.map { it.item })
 
-        modelInteractionStatusMessage = if (rows.isEmpty()) {
+        modelInteractionStatusMessage = if (merged.isEmpty()) {
             "No local model prompt/response history yet."
         } else {
-            "Showing ${rows.size} local model calls (newest first)"
+            "Showing ${merged.size} local model calls (db=${storeItems.size}, log=${fileItems.size})"
         }
+    }
+
+    private fun loadModelInteractionLogItems(limit: Int): List<ModelInteractionSortable> {
+        val file = LocalModelStorageManager.inferenceLogFile(appContext)
+        if (!file.exists()) return emptyList()
+        val lines = runCatching { file.readLines() }.getOrDefault(emptyList())
+        if (lines.isEmpty()) return emptyList()
+
+        return lines.asReversed()
+            .asSequence()
+            .mapNotNull { line ->
+                val json = runCatching { JSONObject(line) }.getOrNull() ?: return@mapNotNull null
+                val payload = runCatching { json.toMap() }.getOrDefault(emptyMap())
+                val occurredAt = valueAsLong(payload["occurredAtMs"]) ?: return@mapNotNull null
+                val prompt = valueAsString(payload["prompt"]).orEmpty()
+                val response = valueAsString(payload["response"]).orEmpty()
+                val nonEmpty = prompt.isNotBlank() || response.isNotBlank()
+                if (!nonEmpty) return@mapNotNull null
+
+                val trigger = valueAsString(payload["trigger"]).orEmpty().ifBlank { "unknown" }
+                val mode = valueAsString(payload["mode"]).orEmpty()
+                val modelLabel = valueAsString(payload["modelLabel"])
+                    ?: valueAsString(payload["modelId"])
+                    ?: "unknown_model"
+                val status = valueAsString(payload["status"]).orEmpty().ifBlank { "logged" }
+                val dedupeKey = listOf(occurredAt.toString(), trigger, mode, prompt.take(120), response.take(120))
+                    .joinToString("|")
+                val syntheticIdSeed = abs(dedupeKey.hashCode().toLong()) + 1L
+
+                ModelInteractionSortable(
+                    occurredAt = occurredAt,
+                    dedupeKey = dedupeKey,
+                    item = ModelInteractionUiState(
+                        id = -syntheticIdSeed,
+                        timestampLabel = formatTime(occurredAt),
+                        trigger = if (mode.isBlank()) trigger else "$trigger/$mode",
+                        modelLabel = modelLabel,
+                        prompt = prompt,
+                        response = response,
+                        status = status,
+                        synced = true,
+                    ),
+                )
+            }
+            .take(limit)
+            .toList()
     }
 
     fun refreshAudioClips(limit: Int = 80) {
@@ -1565,9 +1719,15 @@ class PermissionCommandCenterState internal constructor(
     fun refreshAssistantSessions(limit: Int = 24) {
         val store = ContextEventStore.getInstance(appContext)
         val recentRows = store.getRecent(limit = 2200)
+        val now = System.currentTimeMillis()
+        val maxValidSessionStart = now + ASSISTANT_SESSION_FUTURE_TOLERANCE_MS
         val sessionSpeechByStart = buildAssistantSessionSpeechMap(
             recentRows = recentRows,
             maxSegments = Int.MAX_VALUE,
+        )
+        val sessionLocationByStart = buildAssistantSessionLocationMap(
+            recentRows = recentRows,
+            nowMs = now,
         )
 
         val rows = recentRows
@@ -1582,6 +1742,9 @@ class PermissionCommandCenterState internal constructor(
                 val sessionStartMs = payload["sessionStartMs"]?.toString()?.toLongOrNull()
                     ?: sessionId.removePrefix("session_").toLongOrNull()
                     ?: 0L
+                if (sessionStartMs <= 0L || sessionStartMs > maxValidSessionStart) {
+                    return@mapNotNull null
+                }
                 val persistedSpeech = payload["speechFull"]?.toString().orEmpty()
                     .ifBlank { payload["speechSummary"]?.toString().orEmpty() }
                 val rebuiltSpeech = sessionSpeechByStart[sessionStartMs].orEmpty()
@@ -1602,16 +1765,43 @@ class PermissionCommandCenterState internal constructor(
                     .ifBlank { if (sparklingSession) "manual marker" else "-" }
                 val positionSummary = payload["positionSummary"]?.toString().orEmpty()
                 val indoorOutdoor = payload["indoorOutdoor"]?.toString().orEmpty()
-                val locationLabel = payload["locationLabel"]?.toString().orEmpty()
+                val persistedLocation = payload["locationLabel"]?.toString().orEmpty()
+                val locationLabel = if (
+                    persistedLocation.isNotBlank() &&
+                    !persistedLocation.startsWith("Unknown", ignoreCase = true)
+                ) {
+                    persistedLocation
+                } else {
+                    lookupSessionLocationFallback(
+                        sessionStartMs = sessionStartMs,
+                        locationBySessionStart = sessionLocationByStart,
+                    )
+                }
                 val calendarSummary = payload["calendarSummary"]?.toString().orEmpty()
                 val guessedUserScenario = payload["guessedUserScenario"]?.toString()
                     .orEmpty()
                     .ifBlank { payload["suggestion"]?.toString().orEmpty() }
                 val actionPlan = payload["actionPlan"]?.toString().orEmpty()
+                val cloudGuessedUserScenario = payload["cloudGuessedUserScenario"]?.toString().orEmpty()
+                val cloudActionPlan = payload["cloudActionPlan"]?.toString().orEmpty()
+                val cloudModelLabel = payload["cloudModelLabel"]?.toString().orEmpty()
+                val cloudStatus = payload["cloudStatus"]?.toString().orEmpty()
+                val cloudComparison = payload["cloudComparison"]?.toString()
+                    .orEmpty()
+                    .ifBlank {
+                        when {
+                            cloudActionPlan.isBlank() && cloudStatus.isNotBlank() ->
+                                "Cloud unavailable ($cloudStatus)"
+                            cloudActionPlan.isBlank() -> ""
+                            else -> "Cloud plan generated."
+                        }
+                    }
+                val scenarioForActions = cloudGuessedUserScenario.ifBlank { guessedUserScenario }
+                val actionPlanForActions = cloudActionPlan.ifBlank { actionPlan }
                 val quickActions = AssistantQuickActionPlanner.inferQuickActions(
                     speechSummary = speechSummary,
-                    guessedUserScenario = guessedUserScenario,
-                    actionPlan = actionPlan,
+                    guessedUserScenario = scenarioForActions,
+                    actionPlan = actionPlanForActions,
                     locationLabel = locationLabel,
                     calendarSummary = calendarSummary,
                 )
@@ -1627,10 +1817,15 @@ class PermissionCommandCenterState internal constructor(
                         speechSummary = speechSummary,
                         positionSummary = positionSummary,
                         indoorOutdoor = indoorOutdoor,
-                        locationLabel = locationLabel,
+                        locationLabel = locationLabel.ifBlank { "Unknown location" },
                         calendarSummary = calendarSummary,
                         guessedUserScenario = guessedUserScenario,
                         actionPlan = actionPlan,
+                        cloudGuessedUserScenario = cloudGuessedUserScenario,
+                        cloudActionPlan = cloudActionPlan,
+                        cloudComparison = cloudComparison,
+                        cloudModelLabel = cloudModelLabel,
+                        cloudStatus = cloudStatus,
                         quickActions = quickActions,
                         modelLabel = payload["modelLabel"]?.toString().orEmpty(),
                     ),
@@ -1676,6 +1871,161 @@ class PermissionCommandCenterState internal constructor(
                 maxSegments = maxSegments,
             )
         }
+    }
+
+    private fun buildAssistantSessionLocationMap(
+        recentRows: List<StoredContextEvent>,
+        nowMs: Long,
+    ): Map<Long, String> {
+        val latestBySession = linkedMapOf<Long, Pair<Long, String>>()
+        val minValidTs = nowMs - LOCATION_FALLBACK_LOOKBACK_MS
+        val maxValidTs = nowMs + ASSISTANT_SESSION_FUTURE_TOLERANCE_MS
+
+        recentRows.forEach { row ->
+            if (row.occurredAt !in minValidTs..maxValidTs) return@forEach
+            val sourceLower = row.source.lowercase(Locale.US)
+            val categoryLower = row.category.lowercase(Locale.US)
+            if (categoryLower != "location" && !sourceLower.contains("location")) return@forEach
+
+            val payload = safePayloadMap(row.payloadJson)
+            val lat = valueAsDouble(payload["latitude"])
+            val lon = valueAsDouble(payload["longitude"])
+            val city = valueAsString(payload["city"]).orEmpty()
+
+            val label = when {
+                city.isNotBlank() && lat != null && lon != null ->
+                    "$city | GPS ${"%.4f".format(Locale.US, lat)}, ${"%.4f".format(Locale.US, lon)}"
+                city.isNotBlank() -> city
+                lat != null && lon != null ->
+                    "GPS ${"%.4f".format(Locale.US, lat)}, ${"%.4f".format(Locale.US, lon)}"
+                else -> ""
+            }.ifBlank {
+                row.summary.takeIf { it.contains("Location", ignoreCase = true) }?.take(120).orEmpty()
+            }
+            if (label.isBlank()) return@forEach
+
+            val sessionStart = (row.occurredAt / ASSISTANT_SESSION_WINDOW_MS) * ASSISTANT_SESSION_WINDOW_MS
+            val existing = latestBySession[sessionStart]
+            if (existing == null || row.occurredAt > existing.first) {
+                latestBySession[sessionStart] = row.occurredAt to label
+            }
+        }
+
+        return latestBySession.mapValues { it.value.second }
+    }
+
+    private fun lookupSessionLocationFallback(
+        sessionStartMs: Long,
+        locationBySessionStart: Map<Long, String>,
+    ): String {
+        locationBySessionStart[sessionStartMs]?.let { direct ->
+            if (direct.isNotBlank()) return direct
+        }
+        val minTs = sessionStartMs - LOCATION_FALLBACK_LOOKBACK_MS
+        val bestPrior = locationBySessionStart
+            .asSequence()
+            .filter { (start, label) ->
+                label.isNotBlank() && start in minTs..sessionStartMs
+            }
+            .maxByOrNull { it.key }
+            ?.value
+            .orEmpty()
+        return bestPrior.ifBlank { "Unknown location" }
+    }
+
+    private fun buildContextLogDetail(
+        payload: Map<String, Any?>,
+        summary: String,
+    ): String {
+        val lines = mutableListOf<String>()
+
+        val enabledPlugins = valueAsStringList(payload["enabledPlugins"])
+        if (enabledPlugins.isNotEmpty()) {
+            lines += "enabled_plugins=${enabledPlugins.joinToString(",")}"
+        }
+
+        val byPlugin = payload["eventsByPlugin"] as? Map<*, *>
+        if (!byPlugin.isNullOrEmpty()) {
+            val pluginDigest = byPlugin.entries
+                .sortedByDescending { valueAsInt(it.value) ?: 0 }
+                .joinToString(separator = ", ") { (k, v) ->
+                    "${k.toString()}=${valueAsInt(v) ?: 0}"
+                }
+            lines += "events_by_plugin: $pluginDigest"
+        }
+
+        val byCategory = payload["eventsByCategory"] as? Map<*, *>
+        if (!byCategory.isNullOrEmpty()) {
+            val categoryDigest = byCategory.entries
+                .sortedByDescending { valueAsInt(it.value) ?: 0 }
+                .joinToString(separator = ", ") { (k, v) ->
+                    "${k.toString()}=${valueAsInt(v) ?: 0}"
+                }
+            lines += "events_by_category: $categoryDigest"
+        }
+
+        val rawEvents = payload["events"] as? List<*>
+        if (!rawEvents.isNullOrEmpty()) {
+            rawEvents.take(24).forEach { item ->
+                val row = item as? Map<*, *> ?: return@forEach
+                val source = row["source"]?.toString().orEmpty()
+                val category = row["category"]?.toString().orEmpty()
+                val eventSummary = row["summary"]?.toString().orEmpty()
+                val env = compactEventPayloadForLog(row["payload"])
+                val header = "[$category/$source]"
+                val body = buildString {
+                    if (env.isNotBlank()) append(env)
+                    if (eventSummary.isNotBlank()) {
+                        if (isNotBlank()) append(" | ")
+                        append(eventSummary.take(160))
+                    }
+                }
+                lines += if (body.isBlank()) header else "$header $body"
+            }
+        }
+
+        if (lines.isEmpty()) {
+            return summary
+                .lineSequence()
+                .drop(1)
+                .joinToString(separator = "\n")
+                .ifBlank { summary.take(260) }
+        }
+        return lines.joinToString(separator = "\n")
+    }
+
+    private fun compactEventPayloadForLog(raw: Any?): String {
+        val map = raw as? Map<*, *> ?: return ""
+        val ignoreKeys = setOf(
+            "transcript",
+            "stitchedTranscript",
+            "localTranscript",
+            "prompt",
+            "response",
+            "events",
+            "quickActions",
+        )
+        val pairs = mutableListOf<String>()
+        map.entries.forEach { (keyAny, value) ->
+            val key = keyAny?.toString().orEmpty()
+            if (key.isBlank() || key in ignoreKeys) return@forEach
+            val rendered = when (value) {
+                null -> "null"
+                is String -> value.replace(Regex("\\s+"), " ").trim().take(72)
+                is Number, is Boolean -> value.toString()
+                is List<*> -> value.take(6).joinToString(prefix = "[", postfix = "]") {
+                    it?.toString().orEmpty().take(24)
+                }
+                is Map<*, *> -> value.entries.take(6).joinToString(prefix = "{", postfix = "}") {
+                    "${it.key}=${it.value?.toString().orEmpty().take(18)}"
+                }
+                else -> value.toString().take(72)
+            }
+            if (rendered.isNotBlank()) {
+                pairs += "$key=$rendered"
+            }
+        }
+        return pairs.take(20).joinToString(separator = ", ")
     }
 
     private fun extractAssistantSessionSpeechSignal(

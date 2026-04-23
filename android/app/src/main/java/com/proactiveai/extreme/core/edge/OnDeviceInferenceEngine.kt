@@ -10,21 +10,50 @@ enum class EdgeModelProfile(
     val id: String,
     val label: String,
     val description: String,
+    val defaultLiteRtFileName: String,
+    val approxSizeLabel: String,
 ) {
     GEMMA_EFFECTIVE_2B(
         id = "gemma_effective_2b",
         label = "Gemma Effective 2B",
         description = "Fastest on-device inference and lower battery usage.",
+        defaultLiteRtFileName = "gemma-4-E2B-it.litertlm",
+        approxSizeLabel = "2.3 GB",
     ),
     GEMMA_EFFECTIVE_4B(
         id = "gemma_effective_4b",
         label = "Gemma Effective 4B",
         description = "Higher quality reasoning with higher compute cost.",
+        defaultLiteRtFileName = "gemma-4-E4B-it.litertlm",
+        approxSizeLabel = "4.8 GB",
+    ),
+    QWEN3_0_6B(
+        id = "qwen3_0_6b",
+        label = "Qwen3 0.6B",
+        description = "Lightweight multilingual model with low RAM footprint.",
+        defaultLiteRtFileName = "Qwen3-0.6B.litertlm",
+        approxSizeLabel = "614 MB",
+    ),
+    QWEN2_5_1_5B(
+        id = "qwen2_5_1_5b",
+        label = "Qwen2.5 1.5B",
+        description = "Balanced quality/speed for richer assistant reasoning.",
+        defaultLiteRtFileName = "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
+        approxSizeLabel = "1.6 GB",
+    ),
+    QWEN3_4B(
+        id = "qwen3_4b",
+        label = "Qwen3 4B",
+        description = "High-quality multilingual responses with higher compute cost.",
+        defaultLiteRtFileName = "qwen3_4b_channelwise_int8_float32kv.litertlm",
+        approxSizeLabel = "5.3 GB",
     );
 
     companion object {
+        val default: EdgeModelProfile = GEMMA_EFFECTIVE_2B
+
         fun fromId(value: String): EdgeModelProfile {
-            return entries.firstOrNull { it.id == value } ?: GEMMA_EFFECTIVE_2B
+            return entries.firstOrNull { it.id == value } ?: default
         }
     }
 }
@@ -48,15 +77,17 @@ data class EdgeInferenceTrace(
 )
 
 interface EdgeInferenceStrategy {
-    val profile: EdgeModelProfile
     val label: String
-    fun infer(events: List<ContextEventPayload>): EdgeInferenceResult
+    fun infer(model: EdgeModelProfile, events: List<ContextEventPayload>): EdgeInferenceResult
 }
 
 object OnDeviceInferenceEngine {
     private val strategies: Map<EdgeModelProfile, EdgeInferenceStrategy> = mapOf(
-        FastHeuristicStrategy.profile to FastHeuristicStrategy,
-        DeepHeuristicStrategy.profile to DeepHeuristicStrategy,
+        EdgeModelProfile.GEMMA_EFFECTIVE_2B to FastHeuristicStrategy,
+        EdgeModelProfile.GEMMA_EFFECTIVE_4B to DeepHeuristicStrategy,
+        EdgeModelProfile.QWEN3_0_6B to FastHeuristicStrategy,
+        EdgeModelProfile.QWEN2_5_1_5B to DeepHeuristicStrategy,
+        EdgeModelProfile.QWEN3_4B to DeepHeuristicStrategy,
     )
 
     fun infer(
@@ -84,7 +115,7 @@ object OnDeviceInferenceEngine {
         }
 
         val strategy = strategies[model] ?: FastHeuristicStrategy
-        val heuristic = strategy.infer(events)
+        val heuristic = strategy.infer(model = model, events = events)
         val prompt = buildNativePrompt(events, heuristic)
         val native = runNativeModel(
             context = context,
@@ -163,7 +194,7 @@ object OnDeviceInferenceEngine {
 
         val syntheticEvents = PromptContextBuilder.toSyntheticEvents(prompt)
         val strategy = strategies[model] ?: FastHeuristicStrategy
-        val heuristicOnly = strategy.infer(syntheticEvents)
+        val heuristicOnly = strategy.infer(model = model, events = syntheticEvents)
         return EdgeInferenceTrace(
             result = heuristicOnly.copy(
                 summary = "${heuristicOnly.summary} [Prompt direct mode fallback, synthetic_events=${syntheticEvents.size}]",
@@ -289,12 +320,11 @@ object OnDeviceInferenceEngine {
 }
 
 private object FastHeuristicStrategy : EdgeInferenceStrategy {
-    override val profile: EdgeModelProfile = EdgeModelProfile.GEMMA_EFFECTIVE_2B
-    override val label: String = "2B Fast Heuristic"
+    override val label: String = "Fast Heuristic"
 
-    override fun infer(events: List<ContextEventPayload>): EdgeInferenceResult {
+    override fun infer(model: EdgeModelProfile, events: List<ContextEventPayload>): EdgeInferenceResult {
         if (events.isEmpty()) {
-            return emptyResult(profile, label)
+            return emptyResult(model, label)
         }
 
         val recent = events.sortedByDescending { it.occurredAt }.take(24)
@@ -350,9 +380,9 @@ private object FastHeuristicStrategy : EdgeInferenceStrategy {
             .joinToString { "${it.key}:${it.value}" }
 
         return EdgeInferenceResult(
-            model = profile,
+            model = model,
             strategyLabel = label,
-            summary = "${profile.label}[$label] processed ${recent.size} events, top=$topCategories",
+            summary = "${model.label}[$label] processed ${recent.size} events, top=$topCategories",
             urgencyScore = urgency,
             intentHints = hints.take(4),
             suggestedActions = actions.distinct().take(4),
@@ -363,12 +393,11 @@ private object FastHeuristicStrategy : EdgeInferenceStrategy {
 }
 
 private object DeepHeuristicStrategy : EdgeInferenceStrategy {
-    override val profile: EdgeModelProfile = EdgeModelProfile.GEMMA_EFFECTIVE_4B
-    override val label: String = "4B Deep Heuristic"
+    override val label: String = "Deep Heuristic"
 
-    override fun infer(events: List<ContextEventPayload>): EdgeInferenceResult {
+    override fun infer(model: EdgeModelProfile, events: List<ContextEventPayload>): EdgeInferenceResult {
         if (events.isEmpty()) {
-            return emptyResult(profile, label)
+            return emptyResult(model, label)
         }
 
         val recent = events.sortedByDescending { it.occurredAt }.take(64)
@@ -433,9 +462,9 @@ private object DeepHeuristicStrategy : EdgeInferenceStrategy {
             .joinToString { "${it.key}:${it.value}" }
 
         return EdgeInferenceResult(
-            model = profile,
+            model = model,
             strategyLabel = label,
-            summary = "${profile.label}[$label] analyzed ${recent.size} events, digest=$categoryDigest, semantic_signals=${
+            summary = "${model.label}[$label] analyzed ${recent.size} events, digest=$categoryDigest, semantic_signals=${
                 mapOf(
                     "comm" to commSignals,
                     "planning" to planningSignals,

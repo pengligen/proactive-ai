@@ -14,6 +14,7 @@ import com.proactiveai.extreme.orchestrator.toMap
 import com.proactiveai.extreme.storage.ContextEventStore
 import com.proactiveai.extreme.storage.toPayload
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -21,6 +22,9 @@ import java.util.UUID
 
 object AssistantSessionAutoRunner {
     private const val SESSION_WINDOW_MS = 15 * 60 * 1000L
+    private const val FUTURE_EVENT_TOLERANCE_MS = 10 * 60 * 1000L
+    private const val EVENT_LOOKBACK_MS = 10 * 24 * 60 * 60 * 1000L
+    private const val LOCATION_FALLBACK_LOOKBACK_MS = 12 * 60 * 60 * 1000L
 
     suspend fun runIfDue(context: Context) {
         if (AppPrefs.isGlobalLockEnabled(context)) return
@@ -48,7 +52,14 @@ object AssistantSessionAutoRunner {
         bucket: Long,
         force: Boolean,
     ) {
-        val lastBucket = AppPrefs.getAssistantLastSessionBucket(context)
+        val now = System.currentTimeMillis()
+        val currentBucket = now / SESSION_WINDOW_MS
+        var lastBucket = AppPrefs.getAssistantLastSessionBucket(context)
+        if (lastBucket > currentBucket + 1) {
+            lastBucket = currentBucket - 1
+            AppPrefs.setAssistantLastSessionBucket(context, lastBucket)
+        }
+        if (bucket > currentBucket + 1) return
         if (!force && lastBucket >= bucket) return
 
         val sessionStartMs = bucket * SESSION_WINDOW_MS
@@ -59,21 +70,26 @@ object AssistantSessionAutoRunner {
 
         if (sessionEvents.isEmpty()) {
             if (!force) {
-                AppPrefs.setAssistantLastSessionBucket(context, maxOf(lastBucket, bucket))
+                AppPrefs.setAssistantLastSessionBucket(context, maxOf(lastBucket, bucket).coerceAtMost(currentBucket))
             }
             return
         }
 
         val store = ContextEventStore.getInstance(context)
-        val snapshot = buildSnapshot(sessionEvents)
+        val snapshot = buildSnapshot(
+            events = sessionEvents,
+            fallbackEvents = events,
+        )
         val model = EdgeModelProfile.fromId(AppPrefs.getEdgeModel(context))
+        val pathMap = AppPrefs.getLocalModelPathMap(context)
         val runtimeConfig = LocalModelRuntimeConfig(
             enabled = AppPrefs.isLocalModelEnabled(context),
             backend = LocalModelBackend.fromId(AppPrefs.getLocalModelBackend(context)),
-            modelPath2B = AppPrefs.getLocalModelPath2B(context),
-            modelPath4B = AppPrefs.getLocalModelPath4B(context),
-            ggufPath2B = AppPrefs.getLocalGgufPath2B(context),
-            ggufPath4B = AppPrefs.getLocalGgufPath4B(context),
+            modelPathById = pathMap,
+            ggufPathById = mapOf(
+                EdgeModelProfile.GEMMA_EFFECTIVE_2B.id to AppPrefs.getLocalGgufPath2B(context),
+                EdgeModelProfile.GEMMA_EFFECTIVE_4B.id to AppPrefs.getLocalGgufPath4B(context),
+            ),
             llamaContextSize = AppPrefs.getLocalLlamaContextSize(context),
             llamaThreads = AppPrefs.getLocalLlamaThreads(context),
         )
@@ -86,7 +102,11 @@ object AssistantSessionAutoRunner {
         )
         val result = trace.result
         val raw = result.nativeModelOutput?.trim().takeIf { !it.isNullOrBlank() } ?: result.summary
-        val heuristicGuess = buildHeuristicScenarioGuess(sessionEvents, snapshot)
+        val heuristicGuess = buildHeuristicScenarioGuess(
+            sessionEvents = sessionEvents,
+            snapshot = snapshot,
+            allEvents = events,
+        )
         val parsed = parseOutput(
             output = raw,
             suggestedActions = result.suggestedActions,
@@ -94,13 +114,33 @@ object AssistantSessionAutoRunner {
             fallbackActionPlan = heuristicGuess.actionPlan,
             preferFallback = !result.nativeModelUsed,
         )
+        val cloudOutcome = CloudAssistantActionPlanner.generate(
+            context = context.applicationContext,
+            request = CloudAssistantActionPlanner.SessionRequest(
+                sessionLabel = formatSessionRange(sessionStartMs, sessionEndMs),
+                eventCount = sessionEvents.size,
+                sparklingSession = snapshot.sparklingSignalCount > 0,
+                sparklingSignalCount = snapshot.sparklingSignalCount,
+                sparklingTriggers = snapshot.sparklingTriggers.joinToString(separator = ", ").ifBlank { "-" },
+                speechSummary = snapshot.speechSummary,
+                positionSummary = snapshot.positionSummary,
+                indoorOutdoor = snapshot.indoorOutdoor,
+                locationLabel = snapshot.locationLabel,
+                calendarSummary = snapshot.calendarSummary,
+                localScenario = parsed.guessedUserScenario,
+                localActionPlan = parsed.actionPlan,
+                eventDigest = buildCloudSessionEventDigest(sessionEvents),
+            ),
+        )
+        val scenarioForActions = cloudOutcome.guessedUserScenario.ifBlank { parsed.guessedUserScenario }
+        val actionPlanForActions = cloudOutcome.actionPlan.ifBlank { parsed.actionPlan }
         val quickActions = AssistantQuickActionPlanner.inferQuickActions(
             speechSummary = snapshot.speechSummary,
-            guessedUserScenario = parsed.guessedUserScenario,
-            actionPlan = parsed.actionPlan,
+            guessedUserScenario = scenarioForActions,
+            actionPlan = actionPlanForActions,
             locationLabel = snapshot.locationLabel,
             calendarSummary = snapshot.calendarSummary,
-            extraText = raw,
+            extraText = listOf(raw, cloudOutcome.rawResponse).joinToString("\n"),
         )
         val sessionId = "session_$sessionStartMs"
         val sessionLabel = formatSessionRange(sessionStartMs, sessionEndMs)
@@ -111,7 +151,7 @@ object AssistantSessionAutoRunner {
                 occurredAt = System.currentTimeMillis(),
                 source = "assistant_engine",
                 category = "assistant_session",
-                summary = "Assistant session $sessionLabel | ${parsed.guessedUserScenario.take(120)}",
+                summary = "Assistant session $sessionLabel | ${cloudOutcome.guessedUserScenario.ifBlank { parsed.guessedUserScenario }.take(120)}",
                 payload = mapOf(
                     "sessionId" to sessionId,
                     "sessionLabel" to sessionLabel,
@@ -129,6 +169,11 @@ object AssistantSessionAutoRunner {
                     "guessedUserScenario" to parsed.guessedUserScenario,
                     "suggestion" to parsed.guessedUserScenario,
                     "actionPlan" to parsed.actionPlan,
+                    "cloudGuessedUserScenario" to cloudOutcome.guessedUserScenario,
+                    "cloudActionPlan" to cloudOutcome.actionPlan,
+                    "cloudComparison" to cloudOutcome.comparison,
+                    "cloudModelLabel" to cloudOutcome.modelLabel,
+                    "cloudStatus" to cloudOutcome.status,
                     "quickActions" to AssistantQuickActionPlanner.toPayload(quickActions),
                     "modelLabel" to "${result.model.label} | ${result.strategyLabel}",
                     "recomputed" to force,
@@ -167,20 +212,60 @@ object AssistantSessionAutoRunner {
             )
         )
 
-        AppPrefs.setAssistantLastSessionBucket(context, maxOf(lastBucket, bucket))
+        if (cloudOutcome.attempted) {
+            store.insert(
+                ContextEvent(
+                    eventId = UUID.randomUUID().toString(),
+                    occurredAt = System.currentTimeMillis(),
+                    source = "cloud_model",
+                    category = "model_io",
+                    summary = "Model IO [assistant_session_15m_cloud_auto] ${cloudOutcome.modelLabel} | ${cloudOutcome.status}",
+                    payload = mapOf(
+                        "trigger" to "assistant_session_15m_cloud_auto",
+                        "mode" to "cloud",
+                        "model" to cloudOutcome.modelLabel,
+                        "strategy" to "cloud_action_planner",
+                        "prompt" to cloudOutcome.prompt,
+                        "response" to cloudOutcome.rawResponse.ifBlank { cloudOutcome.detail },
+                        "status" to cloudOutcome.status,
+                        "detail" to cloudOutcome.detail,
+                        "latencyMs" to cloudOutcome.latencyMs,
+                        "contextEventCount" to sessionEvents.size,
+                        "sessionId" to sessionId,
+                        "sessionLabel" to sessionLabel,
+                        "recomputed" to force,
+                    ),
+                    sensitivity = Sensitivity.HIGH,
+                    ttlSeconds = 7 * 24 * 3600,
+                )
+            )
+        }
+
+        AppPrefs.setAssistantLastSessionBucket(context, maxOf(lastBucket, bucket).coerceAtMost(currentBucket))
     }
 
     private fun loadEligibleEvents(context: Context): List<ContextEventPayload> {
         val store = ContextEventStore.getInstance(context)
+        val now = System.currentTimeMillis()
+        val minTs = now - EVENT_LOOKBACK_MS
+        val maxTs = now + FUTURE_EVENT_TOLERANCE_MS
+        val excludedCategories = setOf(
+            "model_io",
+            "assistant_session",
+            "context_log",
+            "audio_gate",
+            "capability_status",
+            "daily_focus",
+        )
         return store.getRecent(limit = 1200)
             .mapNotNull { item ->
                 val payload = safePayloadMap(item.payloadJson)
                 kotlin.runCatching { item.toPayload(payload) }.getOrNull()
             }
             .filterNot { event ->
+                event.occurredAt !in minTs..maxTs ||
                 event.source == "local_model" ||
-                    event.category == "model_io" ||
-                    event.category == "assistant_session" ||
+                    event.category.lowercase(Locale.US) in excludedCategories ||
                     event.category.endsWith("_bootstrap", ignoreCase = true)
             }
     }
@@ -212,10 +297,14 @@ object AssistantSessionAutoRunner {
         val actionPlan: String,
     )
 
-    private fun buildSnapshot(events: List<ContextEventPayload>): Snapshot {
+    private fun buildSnapshot(
+        events: List<ContextEventPayload>,
+        fallbackEvents: List<ContextEventPayload>,
+    ): Snapshot {
         val speechSignals = mutableListOf<SpeechSignal>()
         var latitude: Double? = null
         var longitude: Double? = null
+        var cityLabel: String? = null
         var motionState: String? = null
         var latestLocationSummary: String? = null
         val wifiSignals = mutableListOf<Boolean>()
@@ -242,6 +331,7 @@ object AssistantSessionAutoRunner {
             if (categoryLower == "location" || sourceLower.contains("location")) {
                 if (latitude == null) latitude = payloadDouble(event.payload, "latitude")
                 if (longitude == null) longitude = payloadDouble(event.payload, "longitude")
+                if (cityLabel == null) cityLabel = payloadString(event.payload, "city")
                 if (motionState == null) motionState = payloadString(event.payload, "motionState")
                 if (latestLocationSummary == null) latestLocationSummary = event.summary
             }
@@ -263,6 +353,27 @@ object AssistantSessionAutoRunner {
             }
         }
 
+        if (latitude == null || longitude == null) {
+            val fallback = fallbackEvents
+                .asSequence()
+                .filter { it.occurredAt in ((events.maxOfOrNull { ev -> ev.occurredAt } ?: System.currentTimeMillis()) - LOCATION_FALLBACK_LOOKBACK_MS)..(System.currentTimeMillis() + FUTURE_EVENT_TOLERANCE_MS) }
+                .sortedByDescending { it.occurredAt }
+                .firstOrNull { event ->
+                    val sourceLower = event.source.lowercase(Locale.US)
+                    val categoryLower = event.category.lowercase(Locale.US)
+                    (categoryLower == "location" || sourceLower.contains("location")) &&
+                        payloadDouble(event.payload, "latitude") != null &&
+                        payloadDouble(event.payload, "longitude") != null
+                }
+            if (fallback != null) {
+                if (latitude == null) latitude = payloadDouble(fallback.payload, "latitude")
+                if (longitude == null) longitude = payloadDouble(fallback.payload, "longitude")
+                if (cityLabel == null) cityLabel = payloadString(fallback.payload, "city")
+                if (motionState == null) motionState = payloadString(fallback.payload, "motionState")
+                if (latestLocationSummary == null) latestLocationSummary = fallback.summary
+            }
+        }
+
         val speechSummary = buildSpeechSummaryFromSignals(
             signals = speechSignals,
             maxSegments = 6,
@@ -278,10 +389,13 @@ object AssistantSessionAutoRunner {
         }
 
         val indoorOutdoor = inferIndoorOutdoor(wifiSignals, cellularSignals)
-        val locationLabel = if (latitude != null && longitude != null) {
-            "GPS ${formatCoordinate(latitude)}, ${formatCoordinate(longitude)}"
-        } else {
-            "Unknown location"
+        val locationLabel = when {
+            !cityLabel.isNullOrBlank() && latitude != null && longitude != null ->
+                "$cityLabel | GPS ${formatCoordinate(latitude)}, ${formatCoordinate(longitude)}"
+            !cityLabel.isNullOrBlank() -> cityLabel.orEmpty()
+            latitude != null && longitude != null ->
+                "GPS ${formatCoordinate(latitude)}, ${formatCoordinate(longitude)}"
+            else -> "Unknown location"
         }
 
         val calendarSummary = calendarSignals
@@ -445,16 +559,17 @@ object AssistantSessionAutoRunner {
     ): String {
         return """
             You are a proactive personal assistant running fully on-device.
-            Analyze one 15-minute session and infer the user's likely scenario.
-            The answer must be evidence-grounded, not generic.
-            You must use at least two evidence signals from speech / calendar / motion / connectivity.
-            If mood evidence is weak, state mood as uncertain.
-            Make action steps aggressive and immediately executable in the next 10 minutes.
-            Prefer direct outcomes (book/order/open/contact) over passive suggestions.
-            Only propose domains that are directly supported by session evidence.
-            Do NOT invent unrelated tools/apps/tasks (for example GitHub, calendar prep, Gmail, Slack) unless explicitly supported by speech/calendar/event evidence in this session.
-            If evidence is weak, output fewer steps (1-2) and keep them targeted to the strongest explicit user intent.
-            For each action step, include one concrete endpoint or query target and mention the evidence phrase briefly.
+            Analyze one 15-minute context session and infer the user's real need.
+            Avoid generic productivity templates. Be specific, evidence-grounded, and immediately useful.
+            Prioritize these action classes:
+            1) Deep research candidate: if user mentions investment/finance/company/person/project worth researching.
+            2) Daily-life problem solving: restaurants, milk tea, haircut, shopping, logistics, errands.
+            3) Emotional support: if user sounds angry/sad/anxious/proud, respond with appropriate tone and coping/grounding step.
+            4) Health nudges: hydration, stand/walk, food/rest timing; can leverage recent behavior pattern.
+            5) Explicit command execution: when user clearly asks to investigate/schedule/set up something.
+            For life-problem actions, include direct links or direction/search entry points (maps/search/booking) instead of abstract advice.
+            Every action must be executable in 5-30 minutes.
+            If evidence is weak, output at most 2 precise actions.
 
             Session window: ${formatSessionRange(startMs, endMs)}
             Event count: $eventCount
@@ -466,12 +581,29 @@ object AssistantSessionAutoRunner {
             Calendar signal: ${snapshot.calendarSummary}
 
             Respond in exactly this plain-text format:
-            Guessed User Scenario: <one sentence including likely activity, workload state, and mood>
+            Guessed User Scenario: <one sentence including likely current activity and mood>
             Action Plan:
-            - <step 1>
-            - <step 2>
-            - <step 3>
+            - <step 1 with concrete target + optional direct link/search query + evidence in parentheses>
+            - <step 2 with concrete target + optional direct link/search query + evidence in parentheses>
+            - <step 3 with concrete target + optional direct link/search query + evidence in parentheses>
         """.trimIndent()
+    }
+
+    private fun buildCloudSessionEventDigest(events: List<ContextEventPayload>): String {
+        if (events.isEmpty()) return "- No events."
+        return events
+            .asSequence()
+            .sortedByDescending { it.occurredAt }
+            .take(24)
+            .map { event ->
+                val summary = normalizeSnippet(event.summary)
+                val source = event.source.take(28)
+                val category = event.category.take(28)
+                "- [$category/$source] $summary"
+            }
+            .toList()
+            .joinToString(separator = "\n")
+            .ifBlank { "- No events." }
     }
 
     private fun parseOutput(
@@ -537,27 +669,25 @@ object AssistantSessionAutoRunner {
 
         return Parsed(
             guessedUserScenario = finalScenario.take(220).ifBlank { fallbackScenario },
-            actionPlan = finalActionPlan.take(420).ifBlank { fallbackActionPlan },
+            actionPlan = finalActionPlan.take(720).ifBlank { fallbackActionPlan },
         )
     }
 
     private fun buildHeuristicScenarioGuess(
         sessionEvents: List<ContextEventPayload>,
         snapshot: Snapshot,
+        allEvents: List<ContextEventPayload> = sessionEvents,
     ): HeuristicGuess {
         val hasSpeech = !snapshot.speechSummary.startsWith("No speech", ignoreCase = true)
         val speechLower = snapshot.speechSummary.lowercase(Locale.US)
+        val calendarLower = snapshot.calendarSummary.lowercase(Locale.US)
         val calendarSignals = sessionEvents.count { event ->
-            val lower = event.summary.lowercase(Locale.US)
-            event.category.equals("calendar", ignoreCase = true) ||
-                event.category.equals("task", ignoreCase = true) ||
-                containsAny(lower, listOf("meeting", "calendar", "deadline", "agenda", "appointment"))
+            val categoryLower = event.category.lowercase(Locale.US)
+            categoryLower == "calendar" || categoryLower == "task"
         }
         val commSignals = sessionEvents.count { event ->
-            val lower = event.summary.lowercase(Locale.US)
-            event.category.equals("communication", ignoreCase = true) ||
-                event.category.equals("notification", ignoreCase = true) ||
-                containsAny(lower, listOf("email", "message", "inbox", "slack", "github", "reply", "notification"))
+            val categoryLower = event.category.lowercase(Locale.US)
+            categoryLower == "communication" || categoryLower == "notification"
         }
         val motionState = when {
             snapshot.positionSummary.contains("motion=driving", ignoreCase = true) -> "driving"
@@ -566,34 +696,123 @@ object AssistantSessionAutoRunner {
             else -> "unknown"
         }
 
-        val activity = when {
-            snapshot.sparklingSignalCount > 0 && hasSpeech ->
-                "User intentionally marked a sparkling moment while speaking and expects immediate help"
-            snapshot.sparklingSignalCount > 0 ->
-                "User intentionally marked this as a high-value moment and expects focused proactive support"
-            motionState == "driving" || motionState == "walking" ->
-                "User is likely commuting or moving between locations"
-            calendarSignals > 0 && hasSpeech ->
-                "User is likely preparing for or discussing meetings/tasks"
-            calendarSignals > 0 ->
-                "User is likely in planning mode around upcoming meetings/tasks"
-            commSignals >= 2 ->
-                "User is likely handling communication and coordination work"
-            hasSpeech ->
-                "User is likely in a conversation or active thinking flow"
-            else ->
-                "User activity is low-signal; likely between tasks or quietly working"
-        }
+        val explicitWorkMarkers = listOf(
+            "meeting", "deadline", "client", "customer", "project", "repo", "github",
+            "slack", "email", "inbox", "follow-up", "doc", "ppt", "汇报", "客户", "项目", "会议", "周报", "邮件"
+        )
+        val hasExplicitWorkIntent = containsAny(speechLower, explicitWorkMarkers) ||
+            (!calendarLower.startsWith("no meeting") && containsAny(calendarLower, explicitWorkMarkers))
 
-        val workloadScore = calendarSignals * 2 + commSignals + if (hasSpeech) 1 else 0
-        val workload = when {
-            workloadScore >= 6 -> "high"
-            workloadScore >= 3 -> "medium"
-            else -> "low"
+        val foodIntent = containsAny(
+            speechLower,
+            listOf("奶茶", "milk tea", "bubble tea", "boba", "coffee", "咖啡", "吃饭", "lunch", "dinner", "外卖", "order food", "餐厅"),
+        )
+        val shoppingIntent = containsAny(
+            speechLower,
+            listOf("buy", "purchase", "shop", "shopping", "grocery", "groceries", "超市", "药店", "买", "采购", "下单"),
+        )
+        val commuteIntent = motionState == "driving" || motionState == "walking" ||
+            containsAny(speechLower, listOf("commute", "drive", "parking", "route", "导航", "打车", "地铁", "bus", "train", "trip", "出发"))
+        val socialIntent = containsAny(
+            speechLower,
+            listOf("call", "text", "message", "reply", "follow up", "朋友", "家人", "同事", "联系", "回消息"),
+        )
+        val healthIntent = containsAny(
+            speechLower,
+            listOf("tired", "sleep", "rest", "walk", "exercise", "workout", "累", "休息", "睡", "锻炼", "健康"),
+        )
+        val deepResearchIntent = containsAny(
+            speechLower,
+            listOf(
+                "stock", "stocks", "equity", "earnings", "valuation", "investment", "portfolio", "fund",
+                "crypto", "token", "bond", "ipo", "company", "founder", "ceo", "market", "trading", "macro",
+                "project", "person", "research", "investigate", "due diligence", "尽调", "调研", "投资", "股票", "基金", "项目", "人物",
+            ),
+        )
+        val haircutIntent = containsAny(
+            speechLower,
+            listOf("haircut", "barber", "salon", "理发", "发型", "剪头发"),
+        )
+        val restaurantIntent = containsAny(
+            speechLower,
+            listOf("restaurant", "dining", "eat", "lunch", "dinner", "brunch", "餐厅", "吃饭"),
+        )
+        val explicitCommandIntent = containsAny(
+            speechLower,
+            listOf("investigate", "look into", "find out", "schedule", "set meeting", "book", "reserve", "remind me", "帮我查", "帮我调查", "安排", "预订"),
+        )
+        val angerIntent = containsAny(
+            speechLower,
+            listOf("angry", "annoyed", "frustrated", "furious", "烦", "生气", "躁", "火大"),
+        )
+        val sadIntent = containsAny(
+            speechLower,
+            listOf("sad", "down", "lonely", "depressed", "upset", "难过", "低落", "伤心", "沮丧"),
+        )
+        val proudIntent = containsAny(
+            speechLower,
+            listOf("proud", "excited", "confident", "great", "awesome", "得意", "兴奋", "自信"),
+        )
+        val sessionEndMs = sessionEvents.maxOfOrNull { it.occurredAt } ?: System.currentTimeMillis()
+        val sessionHour = java.util.Calendar.getInstance().apply { timeInMillis = sessionEndMs }.get(java.util.Calendar.HOUR_OF_DAY)
+        val mealWindow = sessionHour in 11..14 || sessionHour in 18..21
+        val motionSignals2h = allEvents
+            .asSequence()
+            .filter { it.occurredAt in (sessionEndMs - 2 * 60 * 60 * 1000L)..sessionEndMs }
+            .filter { it.category.equals("location", ignoreCase = true) || it.source.contains("location", ignoreCase = true) }
+            .mapNotNull { payloadString(it.payload, "motionState")?.lowercase(Locale.US) }
+            .toList()
+        val mostlyStill2h = motionSignals2h.isNotEmpty() &&
+            motionSignals2h.count { it == "still" || it == "unknown" } >= (motionSignals2h.size * 0.7)
+        val healthNudgeIntent = healthIntent || mostlyStill2h || (mealWindow && hasSpeech)
+        val locationHint = snapshot.locationLabel
+            .takeIf { it.isNotBlank() && !it.startsWith("Unknown", ignoreCase = true) }
+            ?.take(48)
+            ?: "near me"
+        val milkTeaLink = "https://www.google.com/maps/search/?api=1&query=${encodeQuery("$locationHint milk tea")}"
+        val restaurantLink = "https://www.google.com/maps/search/?api=1&query=${encodeQuery("$locationHint restaurant reservation")}"
+        val haircutLink = "https://www.google.com/maps/search/?api=1&query=${encodeQuery("$locationHint barber salon")}"
+        val deepResearchLink = "https://www.google.com/search?udm=50&q=${encodeQuery("${snapshot.speechSummary.take(80)} deep research latest analysis")}"
+
+        val activity = when {
+            deepResearchIntent ->
+                "User surfaced a topic that likely needs deep research before acting"
+            snapshot.sparklingSignalCount > 0 && hasSpeech ->
+                "User intentionally marked a sparkling moment and likely wants fast help on a specific personal need"
+            snapshot.sparklingSignalCount > 0 ->
+                "User intentionally marked this as high-value and expects focused assistance now"
+            angerIntent || sadIntent || proudIntent ->
+                "User appears emotionally loaded and needs context-aware support, not generic productivity"
+            foodIntent ->
+                "User likely wants immediate food/drink options and a quick decision"
+            commuteIntent ->
+                "User is likely moving between places and needs low-friction guidance"
+            shoppingIntent || haircutIntent || restaurantIntent ->
+                "User likely has a purchase/errand intent and needs fast options"
+            socialIntent ->
+                "User likely needs to contact someone or follow up on a conversation"
+            explicitCommandIntent ->
+                "User issued an explicit command and expects direct execution support"
+            hasExplicitWorkIntent ->
+                "User likely has a work-related follow-up that needs a concrete next step"
+            hasSpeech ->
+                "User is in an active thinking/conversation flow with practical immediate intent"
+            else ->
+                "Signal is light; user is likely between tasks"
         }
         val mood = when {
+            angerIntent ->
+                "agitated"
+            sadIntent ->
+                "sad/low-energy"
+            proudIntent ->
+                "confident/excited"
             containsAny(speechLower, listOf("urgent", "rush", "deadline", "late", "stressed", "烦", "急")) ->
                 "slightly stressed"
+            containsAny(speechLower, listOf("hungry", "饿", "想喝", "want to drink")) ->
+                "intent-driven"
+            containsAny(speechLower, listOf("tired", "累", "困", "sleepy")) ->
+                "fatigued"
             containsAny(speechLower, listOf("great", "good", "nice", "happy", "awesome", "开心", "不错")) ->
                 "positive"
             hasSpeech ->
@@ -606,42 +825,85 @@ object AssistantSessionAutoRunner {
             if (snapshot.sparklingSignalCount > 0) {
                 add("sparkling_marker=${snapshot.sparklingTriggers.joinToString(",").ifBlank { "manual" }}")
             }
-            if (calendarSignals > 0) add("calendar/task signals=$calendarSignals")
+            if (deepResearchIntent) add("deep-research markers in speech")
+            if (foodIntent) add("food/drink phrase in speech")
+            if (haircutIntent) add("grooming service phrase in speech")
+            if (shoppingIntent) add("purchase/errand phrase in speech")
+            if (restaurantIntent) add("restaurant booking phrase in speech")
+            if (explicitCommandIntent) add("explicit command phrase in speech")
+            if (angerIntent || sadIntent || proudIntent) add("emotional expression in speech")
+            if (socialIntent) add("contact/follow-up phrase in speech")
+            if (healthNudgeIntent) add("health/rest or sedentary pattern signal")
+            if (calendarSignals > 0 && hasExplicitWorkIntent) add("calendar/task signals=$calendarSignals")
             if (commSignals > 0) add("communication signals=$commSignals")
+            if (mostlyStill2h) add("mostly still in last ~2h")
             if (motionState != "unknown") add("motion=$motionState")
             if (!snapshot.indoorOutdoor.equals("Unknown", ignoreCase = true)) add(snapshot.indoorOutdoor)
             if (hasSpeech) add("speech=\"${snapshot.speechSummary.take(70)}\"")
         }.ifEmpty { listOf("limited context signals") }
 
-        val sparklingBoost = if (snapshot.sparklingSignalCount > 0) 16 else 0
-        val confidence = (45 + evidence.size * 10 + minOf(3, workloadScore) * 5 + sparklingBoost).coerceIn(35, 96)
+        val intentScore = listOf(
+            foodIntent,
+            shoppingIntent,
+            commuteIntent,
+            socialIntent,
+            healthNudgeIntent,
+            deepResearchIntent,
+            explicitCommandIntent,
+        )
+            .count { it }
+        val sparklingBoost = if (snapshot.sparklingSignalCount > 0) 14 else 0
+        val confidence = (44 + evidence.size * 9 + intentScore * 5 + sparklingBoost).coerceIn(35, 96)
         val scenario = buildString {
-            append("$activity; workload=$workload; mood=$mood; confidence=$confidence%. ")
+            append("$activity; mood=$mood; confidence=$confidence%. ")
             append("Evidence: ${evidence.joinToString(", ")}.")
         }.take(220)
 
         val actions = mutableListOf<String>()
         if (snapshot.sparklingSignalCount > 0) {
-            actions += "Capture this sparkling moment as a priority note with one concrete next action and deadline."
+            actions += "Pin this sparkling moment and convert it into one concrete next step the user can execute now."
         }
-        val milkTeaIntent = containsAny(speechLower, listOf("奶茶", "milk tea", "bubble tea", "boba", "茶饮"))
-        if (milkTeaIntent) {
-            actions += "Find top nearby milk tea shops by ETA and rating, then show direct order/search links."
-            actions += "Prepare a default order draft (size, sugar, ice) and ask one-tap confirmation."
+        if (deepResearchIntent) {
+            actions += "Run deep research now: build a one-page brief (thesis, upside, downside, key people, next 7-day catalysts). Link: $deepResearchLink (evidence: research/investment phrase)."
         }
-        if (calendarSignals > 0) {
-            actions += "Prepare a 3-point brief for the next meeting/task."
-            actions += "Surface the most relevant notes/files before the meeting."
+        if (foodIntent) {
+            actions += "Find 3 nearby milk tea options with ratings + distance + open direction link: $milkTeaLink (evidence: speech intent)."
+            actions += "Open an AI search for best current deals/coupons near $locationHint: https://www.google.com/search?udm=50&q=${encodeQuery("$locationHint milk tea deals coupon")} (evidence: drink intent)."
         }
-        if (commSignals > 0) {
-            actions += "Prioritize top pending messages and draft concise replies."
+        if (restaurantIntent) {
+            actions += "Show reservable restaurants near current area with direct map/search entry: $restaurantLink (evidence: dining intent)."
         }
-        if (motionState == "driving" || motionState == "walking") {
-            actions += "Keep interventions short and defer deep tasks until stationary."
+        if (haircutIntent) {
+            actions += "Find top-rated barber/salon options and open direction: $haircutLink (evidence: haircut phrase)."
         }
-        if (actions.isEmpty()) {
-            actions += "Run one targeted search from current context and surface three executable links."
-            actions += "Ask one confirmation question, then execute the highest-confidence next step."
+        if (shoppingIntent) {
+            actions += "Create a buy-now checklist and open nearest store search: https://www.google.com/maps/search/?api=1&query=${encodeQuery("$locationHint grocery store")} (evidence: purchase phrase)."
+        }
+        if (commuteIntent) {
+            actions += "Open quickest route/travel option from current location and suggest optimal departure timing (evidence: motion/location)."
+        }
+        if (angerIntent) {
+            actions += "Emotional guardrail: pause 90 seconds before reacting, then draft a calm response in 3 lines (evidence: anger markers)."
+        }
+        if (sadIntent) {
+            actions += "Support mode: start a short check-in conversation now and suggest one low-effort comforting step (walk/water/call a trusted person)."
+        }
+        if (proudIntent) {
+            actions += "Momentum with caution: capture this win in 2 lines, then add one risk-control check before next decision."
+        }
+        if (socialIntent) {
+            actions += "Draft a concise follow-up message for the mentioned person with one clear ask (evidence: contact phrase)."
+        }
+        if (healthNudgeIntent) {
+            actions += "Health nudge: stand up, drink water, and do a 3-5 minute walk now; then set a 30-minute movement reminder (evidence: sedentary/health signal)."
+        }
+        if (explicitCommandIntent || hasExplicitWorkIntent) {
+            actions += "Convert the explicit command into an execution checklist with owner/time/output and start with step 1 immediately."
+        }
+        if (actions.isEmpty() && hasSpeech) {
+            actions += "Use the strongest spoken phrase to produce 3 concrete next options with direct links near current context."
+        } else if (actions.isEmpty()) {
+            actions += "Ask one concise clarification question, then open an AI search entry to unblock next step: https://www.google.com/search?udm=50&q=${encodeQuery("best next step based on current context near me")}."
         }
 
         return HeuristicGuess(
@@ -669,10 +931,30 @@ object AssistantSessionAutoRunner {
     private fun isWeakActionPlan(text: String): Boolean {
         val lower = text.lowercase(Locale.US)
         if (text.length < 24) return true
-        return containsAny(
+        val hasDirectEntry = lower.contains("http://") ||
+            lower.contains("https://") ||
+            lower.contains("maps/search") ||
+            lower.contains("google.com/search")
+        val generic = containsAny(
             lower,
-            listOf("continue passive monitoring", "wait for stronger context", "no action")
+            listOf(
+                "continue passive monitoring",
+                "wait for stronger context",
+                "no action",
+                "open calendar",
+                "check calendar",
+                "open github",
+                "prepare a 3-point brief",
+                "surface the most relevant notes",
+                "prioritize top pending messages",
+                "review notes",
+                "maintain monitoring",
+                "keep collecting context",
+            )
         )
+        if (generic && !hasDirectEntry) return true
+        val weakVerbCount = listOf("open", "check", "review", "monitor").count { lower.contains(it) }
+        return weakVerbCount >= 2 && !hasDirectEntry
     }
 
     private fun containsAny(text: String, needles: List<String>): Boolean {
@@ -684,6 +966,10 @@ object AssistantSessionAutoRunner {
             .replace(Regex("^\\s*[-*•]+\\s*"), "")
             .replace(Regex("^\\s*\\d+[\\).]\\s*"), "")
             .trim()
+    }
+
+    private fun encodeQuery(input: String): String {
+        return URLEncoder.encode(input, Charsets.UTF_8.name())
     }
 
     private fun safePayloadMap(payloadJson: String): Map<String, Any> {

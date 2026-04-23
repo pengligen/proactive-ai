@@ -26,10 +26,8 @@ enum class LocalModelBackend(
 data class LocalModelRuntimeConfig(
     val enabled: Boolean,
     val backend: LocalModelBackend = LocalModelBackend.LITERT_LM,
-    val modelPath2B: String,
-    val modelPath4B: String,
-    val ggufPath2B: String,
-    val ggufPath4B: String,
+    val modelPathById: Map<String, String>,
+    val ggufPathById: Map<String, String>,
     val maxTokens: Int = 256,
     val topK: Int = 40,
     val temperature: Float = 0.8f,
@@ -37,17 +35,11 @@ data class LocalModelRuntimeConfig(
     val llamaThreads: Int = 0,
 ) {
     fun taskPathFor(profile: EdgeModelProfile): String {
-        return when (profile) {
-            EdgeModelProfile.GEMMA_EFFECTIVE_2B -> modelPath2B
-            EdgeModelProfile.GEMMA_EFFECTIVE_4B -> modelPath4B
-        }
+        return modelPathById[profile.id].orEmpty()
     }
 
     fun ggufPathFor(profile: EdgeModelProfile): String {
-        return when (profile) {
-            EdgeModelProfile.GEMMA_EFFECTIVE_2B -> ggufPath2B
-            EdgeModelProfile.GEMMA_EFFECTIVE_4B -> ggufPath4B
-        }
+        return ggufPathById[profile.id].orEmpty()
     }
 }
 

@@ -1994,10 +1994,11 @@ class AudioAmbientPlugin(
         return LocalModelRuntimeConfig(
             enabled = AppPrefs.isLocalModelEnabled(context),
             backend = LocalModelBackend.LITERT_LM,
-            modelPath2B = AppPrefs.getLocalModelPath2B(context),
-            modelPath4B = AppPrefs.getLocalModelPath4B(context),
-            ggufPath2B = AppPrefs.getLocalGgufPath2B(context),
-            ggufPath4B = AppPrefs.getLocalGgufPath4B(context),
+            modelPathById = AppPrefs.getLocalModelPathMap(context),
+            ggufPathById = mapOf(
+                EdgeModelProfile.GEMMA_EFFECTIVE_2B.id to AppPrefs.getLocalGgufPath2B(context),
+                EdgeModelProfile.GEMMA_EFFECTIVE_4B.id to AppPrefs.getLocalGgufPath4B(context),
+            ),
             maxTokens = 96,
             topK = 32,
             temperature = 0.1f,

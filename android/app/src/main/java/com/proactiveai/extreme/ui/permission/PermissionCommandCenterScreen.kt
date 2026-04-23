@@ -30,7 +30,9 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -44,6 +46,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -92,6 +96,7 @@ import com.proactiveai.extreme.core.context.Sensitivity
 import com.proactiveai.extreme.core.edge.EdgeModelProfile
 import com.proactiveai.extreme.core.edge.EdgeInferenceTrace
 import com.proactiveai.extreme.core.edge.LocalModelBackend
+import com.proactiveai.extreme.core.edge.LocalModelStorageManager
 import com.proactiveai.extreme.core.edge.LocalModelRuntimeConfig
 import com.proactiveai.extreme.core.edge.ModelDownloadPlan
 import com.proactiveai.extreme.core.edge.OnDeviceInferenceEngine
@@ -112,6 +117,7 @@ import com.proactiveai.extreme.orchestrator.PlanRequestPayload
 import com.proactiveai.extreme.orchestrator.toMap
 import com.proactiveai.extreme.permission.PermissionStatusResolver
 import com.proactiveai.extreme.service.AssistantSessionAutoRunner
+import com.proactiveai.extreme.service.CloudAssistantActionPlanner
 import com.proactiveai.extreme.service.CloudSpeechTranscriptionRefiner
 import com.proactiveai.extreme.service.DailyFocusTop3AutoRunner
 import com.proactiveai.extreme.service.ProactiveCollectionService
@@ -157,6 +163,9 @@ private const val ASSISTANT_DIARY_MAX_ITEMS = 12
 private const val ASSISTANT_DIARY_WINDOW_MS = 24 * 60 * 60 * 1000L
 private const val ASSISTANT_DIARY_REFRESH_MS = ASSISTANT_DIARY_WINDOW_MS
 private val ASSISTANT_DIARY_SCROLL_MAX_HEIGHT = 520.dp
+private const val ASSISTANT_SESSION_FUTURE_TOLERANCE_MS = 10 * 60 * 1000L
+private const val ASSISTANT_SESSION_LOOKBACK_MS = 10 * 24 * 60 * 60 * 1000L
+private const val LOCATION_SESSION_FALLBACK_LOOKBACK_MS = 12 * 60 * 60 * 1000L
 private const val EXECUTION_QUEUE_RENDER_MAX_ITEMS = 12
 private val EXECUTION_QUEUE_SCROLL_MAX_HEIGHT = 420.dp
 private const val ENGAGED_SESSION_RENDER_MAX_ITEMS = 10
@@ -180,21 +189,16 @@ fun PermissionCommandCenterScreen(
     var showModelConfigDialog by remember { mutableStateOf(false) }
     var showMobileSyncConfigDialog by remember { mutableStateOf(false) }
     var inferenceTestInput by rememberSaveable {
-        mutableStateOf("I have 5 unread emails and a meeting in 30 minutes, prepare me a concise brief.")
+        mutableStateOf("你是谁，给我描述一下你的功能")
     }
     var inferenceResultText by rememberSaveable { mutableStateOf("") }
     var modelConfigEnabled by rememberSaveable { mutableStateOf(state.localModelEnabled) }
-    var modelConfigPath2B by rememberSaveable { mutableStateOf(state.localModelPath2B) }
-    var modelConfigPath4B by rememberSaveable { mutableStateOf(state.localModelPath4B) }
+    var modelConfigPathActive by rememberSaveable {
+        mutableStateOf(state.localModelPathFor(EdgeModelProfile.fromId(state.edgeModelId)))
+    }
+    var modelConfigActiveModelId by rememberSaveable { mutableStateOf(state.edgeModelId) }
     var modelConfigOpenAiKey by rememberSaveable { mutableStateOf(state.openAiApiKey) }
     var selectedModelDownloadProfile by rememberSaveable { mutableStateOf(EdgeModelProfile.GEMMA_EFFECTIVE_2B.id) }
-    var modelDownloadUrl2B by rememberSaveable {
-        mutableStateOf(ModelDownloadPlan.defaultUrlFor(EdgeModelProfile.GEMMA_EFFECTIVE_2B))
-    }
-    var modelDownloadUrl4B by rememberSaveable {
-        mutableStateOf(ModelDownloadPlan.defaultUrlFor(EdgeModelProfile.GEMMA_EFFECTIVE_4B))
-    }
-    var modelDownloadToken by rememberSaveable { mutableStateOf(state.huggingFaceToken) }
     var modelDownloadInFlight by rememberSaveable { mutableStateOf(false) }
     var mobileSyncBaseUrl by rememberSaveable { mutableStateOf(state.mobileApiBaseUrl) }
     var activeAudioClipPath by rememberSaveable { mutableStateOf("") }
@@ -275,9 +279,12 @@ fun PermissionCommandCenterScreen(
         }
     }
 
-    fun downloadSelectedModelToPrivateStorage() {
+    fun downloadSelectedModelToPrivateStorage(
+        profileOverride: EdgeModelProfile? = null,
+    ) {
         if (modelDownloadInFlight) return
-        val selectedProfile = EdgeModelProfile.fromId(selectedModelDownloadProfile)
+        val selectedProfile = profileOverride ?: EdgeModelProfile.fromId(selectedModelDownloadProfile)
+        selectedModelDownloadProfile = selectedProfile.id
         if (isGlobalLocked()) {
             val profileLabel = ModelDownloadPlan.shortLabelFor(selectedProfile)
             markLockBlocked("$profileLabel model download")
@@ -291,12 +298,8 @@ fun PermissionCommandCenterScreen(
             try {
                 state.downloadAndActivateModel(
                     profile = selectedProfile,
-                    downloadUrl = modelDownloadDraftForProfile(
-                        selectedProfile = selectedProfile,
-                        url2B = modelDownloadUrl2B,
-                        url4B = modelDownloadUrl4B,
-                    ),
-                    huggingFaceToken = modelDownloadToken,
+                    downloadUrl = ModelDownloadPlan.defaultUrlFor(selectedProfile),
+                    huggingFaceToken = state.huggingFaceToken,
                 )
             } finally {
                 modelDownloadInFlight = false
@@ -480,6 +483,73 @@ fun PermissionCommandCenterScreen(
             ttlSeconds = 7 * 24 * 3600,
         )
         store.insert(record)
+        runCatching {
+            LocalModelStorageManager.appendInferenceLog(
+                context = context.applicationContext,
+                entry = com.proactiveai.extreme.core.edge.ModelInferenceLogEntry(
+                    occurredAtMs = record.occurredAt,
+                    trigger = trigger,
+                    mode = trace.mode,
+                    modelId = result.model.id,
+                    modelLabel = result.model.label,
+                    prompt = trace.prompt,
+                    response = response,
+                    status = result.nativeModelMessage,
+                    nativeUsed = result.nativeModelUsed,
+                ),
+            )
+        }
+    }
+
+    fun persistCloudAssistantTrace(
+        trigger: String,
+        outcome: CloudAssistantActionPlanner.Outcome,
+        contextEventCount: Int,
+        sessionId: String,
+        sessionLabel: String,
+    ) {
+        if (!outcome.attempted) return
+        val response = outcome.rawResponse.ifBlank { outcome.detail }
+        val record = ContextEvent(
+            eventId = UUID.randomUUID().toString(),
+            occurredAt = System.currentTimeMillis(),
+            source = "cloud_model",
+            category = "model_io",
+            summary = "Model IO [$trigger] ${outcome.modelLabel} | ${outcome.status}",
+            payload = mapOf(
+                "trigger" to trigger,
+                "mode" to "cloud",
+                "model" to outcome.modelLabel,
+                "strategy" to "cloud_action_planner",
+                "prompt" to outcome.prompt,
+                "response" to response,
+                "status" to outcome.status,
+                "detail" to outcome.detail,
+                "latencyMs" to outcome.latencyMs,
+                "contextEventCount" to contextEventCount,
+                "sessionId" to sessionId,
+                "sessionLabel" to sessionLabel,
+            ),
+            sensitivity = Sensitivity.HIGH,
+            ttlSeconds = 7 * 24 * 3600,
+        )
+        store.insert(record)
+        runCatching {
+            LocalModelStorageManager.appendInferenceLog(
+                context = context.applicationContext,
+                entry = com.proactiveai.extreme.core.edge.ModelInferenceLogEntry(
+                    occurredAtMs = record.occurredAt,
+                    trigger = trigger,
+                    mode = "cloud",
+                    modelId = outcome.modelLabel.lowercase(Locale.US).replace(Regex("[^a-z0-9._-]"), "_"),
+                    modelLabel = outcome.modelLabel,
+                    prompt = outcome.prompt,
+                    response = response,
+                    status = outcome.status,
+                    nativeUsed = false,
+                ),
+            )
+        }
     }
 
     fun persistAssistantSessionRow(
@@ -491,7 +561,7 @@ fun PermissionCommandCenterScreen(
             occurredAt = System.currentTimeMillis(),
             source = "assistant_engine",
             category = "assistant_session",
-            summary = "Assistant session ${row.sessionLabel} | ${row.guessedUserScenario.take(120)}",
+            summary = "Assistant session ${row.sessionLabel} | ${row.cloudGuessedUserScenario.ifBlank { row.guessedUserScenario }.take(120)}",
             payload = mapOf(
                 "sessionId" to row.sessionId,
                 "sessionLabel" to row.sessionLabel,
@@ -509,6 +579,11 @@ fun PermissionCommandCenterScreen(
                 "guessedUserScenario" to row.guessedUserScenario,
                 "suggestion" to row.guessedUserScenario,
                 "actionPlan" to row.actionPlan,
+                "cloudGuessedUserScenario" to row.cloudGuessedUserScenario,
+                "cloudActionPlan" to row.cloudActionPlan,
+                "cloudComparison" to row.cloudComparison,
+                "cloudModelLabel" to row.cloudModelLabel,
+                "cloudStatus" to row.cloudStatus,
                 "quickActions" to AssistantQuickActionPlanner.toPayload(row.quickActions),
                 "modelLabel" to row.modelLabel,
             ),
@@ -768,35 +843,68 @@ fun PermissionCommandCenterScreen(
                 val edgeModel = EdgeModelProfile.fromId(state.edgeModelId)
                 val rows = sessions.map { session ->
                     val snapshot = buildSessionContextSnapshot(context, session.events)
-                    val heuristicGuess = buildHeuristicScenarioGuess(session, snapshot)
-                    val prompt = buildAssistantPromptForSession(session, snapshot)
-                    val trace = OnDeviceInferenceEngine.inferFromPromptWithTrace(
+                    val heuristicGuess = buildHeuristicScenarioGuess(
+                        session = session,
+                        snapshot = snapshot,
+                        allEvents = contextWindow,
+                    )
+                    val localPrompt = buildAssistantPromptForSession(session, snapshot)
+                    val localTrace = OnDeviceInferenceEngine.inferFromPromptWithTrace(
                         context = context,
                         model = edgeModel,
-                        prompt = prompt,
+                        prompt = localPrompt,
                         runtimeConfig = state.localRuntimeConfig(),
                     )
                     persistModelTrace(
                         trigger = "assistant_session_15m",
-                        trace = trace,
+                        trace = localTrace,
                         contextEventCount = session.events.size,
                     )
-                    val result = trace.result
-                    val raw = result.nativeModelOutput?.trim().takeIf { !it.isNullOrBlank() } ?: result.summary
-                    val parsed = parseSessionInferenceOutput(
-                        output = raw,
-                        suggestedActions = result.suggestedActions,
+                    val localResult = localTrace.result
+                    val localRaw = localResult.nativeModelOutput?.trim().takeIf { !it.isNullOrBlank() } ?: localResult.summary
+                    val localParsed = parseSessionInferenceOutput(
+                        output = localRaw,
+                        suggestedActions = localResult.suggestedActions,
                         fallbackScenario = heuristicGuess.scenario,
                         fallbackActionPlan = heuristicGuess.actionPlan,
-                        preferFallback = !result.nativeModelUsed,
+                        preferFallback = !localResult.nativeModelUsed,
                     )
+
+                    val cloudOutcome = CloudAssistantActionPlanner.generate(
+                        context = context.applicationContext,
+                        request = CloudAssistantActionPlanner.SessionRequest(
+                            sessionLabel = formatSessionRange(session.startMs, session.endMs),
+                            eventCount = session.events.size,
+                            sparklingSession = session.isSparkling,
+                            sparklingSignalCount = session.sparklingSignalCount,
+                            sparklingTriggers = session.sparklingTriggers.joinToString(separator = ", ").ifBlank { "-" },
+                            speechSummary = snapshot.speechSummary,
+                            positionSummary = snapshot.positionSummary,
+                            indoorOutdoor = snapshot.indoorOutdoor,
+                            locationLabel = snapshot.locationLabel,
+                            calendarSummary = snapshot.calendarSummary,
+                            localScenario = localParsed.guessedUserScenario,
+                            localActionPlan = localParsed.actionPlan,
+                            eventDigest = buildCloudSessionEventDigest(session.events),
+                        ),
+                    )
+                    persistCloudAssistantTrace(
+                        trigger = "assistant_session_15m_cloud",
+                        outcome = cloudOutcome,
+                        contextEventCount = session.events.size,
+                        sessionId = session.sessionId,
+                        sessionLabel = formatSessionRange(session.startMs, session.endMs),
+                    )
+
+                    val scenarioForActions = cloudOutcome.guessedUserScenario.ifBlank { localParsed.guessedUserScenario }
+                    val planForActions = cloudOutcome.actionPlan.ifBlank { localParsed.actionPlan }
                     val quickActions = AssistantQuickActionPlanner.inferQuickActions(
                         speechSummary = snapshot.speechSummary,
-                        guessedUserScenario = parsed.guessedUserScenario,
-                        actionPlan = parsed.actionPlan,
+                        guessedUserScenario = scenarioForActions,
+                        actionPlan = planForActions,
                         locationLabel = snapshot.locationLabel,
                         calendarSummary = snapshot.calendarSummary,
-                        extraText = raw,
+                        extraText = listOf(localRaw, cloudOutcome.rawResponse).joinToString("\n"),
                     )
 
                     AssistantSessionRowUiState(
@@ -811,10 +919,15 @@ fun PermissionCommandCenterScreen(
                         indoorOutdoor = snapshot.indoorOutdoor,
                         locationLabel = snapshot.locationLabel,
                         calendarSummary = snapshot.calendarSummary,
-                        guessedUserScenario = parsed.guessedUserScenario,
-                        actionPlan = parsed.actionPlan,
+                        guessedUserScenario = localParsed.guessedUserScenario,
+                        actionPlan = localParsed.actionPlan,
+                        cloudGuessedUserScenario = cloudOutcome.guessedUserScenario,
+                        cloudActionPlan = cloudOutcome.actionPlan,
+                        cloudComparison = cloudOutcome.comparison,
+                        cloudModelLabel = cloudOutcome.modelLabel,
+                        cloudStatus = cloudOutcome.status,
                         quickActions = quickActions,
-                        modelLabel = "${result.model.label} | ${result.strategyLabel}",
+                        modelLabel = "${localResult.model.label} | ${localResult.strategyLabel}",
                     )
                 }
 
@@ -1460,31 +1573,19 @@ fun PermissionCommandCenterScreen(
                         onModelSelected = { modelId -> state.setEdgeModel(modelId) },
                         onOpenInferenceTest = { showInferenceTestDialog = true },
                         onOpenModelConfig = {
+                            val activeProfile = EdgeModelProfile.fromId(state.edgeModelId)
                             modelConfigEnabled = state.localModelEnabled
-                            modelConfigPath2B = state.localModelPath2B
-                            modelConfigPath4B = state.localModelPath4B
+                            modelConfigActiveModelId = activeProfile.id
+                            modelConfigPathActive = state.localModelPathFor(activeProfile)
                             modelConfigOpenAiKey = state.openAiApiKey
                             showModelConfigDialog = true
                         },
                         selectedDownloadProfile = EdgeModelProfile.fromId(selectedModelDownloadProfile),
-                        modelDownloadUrl = modelDownloadDraftForProfile(
-                            selectedProfile = EdgeModelProfile.fromId(selectedModelDownloadProfile),
-                            url2B = modelDownloadUrl2B,
-                            url4B = modelDownloadUrl4B,
-                        ),
-                        modelDownloadToken = modelDownloadToken,
                         modelDownloadInFlight = modelDownloadInFlight,
                         onDownloadTargetSelected = { profile ->
                             selectedModelDownloadProfile = profile.id
                         },
-                        onModelDownloadUrlChange = { updated ->
-                            when (EdgeModelProfile.fromId(selectedModelDownloadProfile)) {
-                                EdgeModelProfile.GEMMA_EFFECTIVE_2B -> modelDownloadUrl2B = updated
-                                EdgeModelProfile.GEMMA_EFFECTIVE_4B -> modelDownloadUrl4B = updated
-                            }
-                        },
-                        onModelDownloadTokenChange = { modelDownloadToken = it },
-                        onDownloadModel = ::downloadSelectedModelToPrivateStorage,
+                        onDownloadModel = { downloadSelectedModelToPrivateStorage() },
                         onRefreshModelCalls = { state.refreshModelInteractions() },
                     )
                 }
@@ -1645,19 +1746,21 @@ fun PermissionCommandCenterScreen(
     if (showModelConfigDialog) {
         LocalModelConfigDialog(
             enabled = modelConfigEnabled,
-            path2B = modelConfigPath2B,
-            path4B = modelConfigPath4B,
+            activeModel = EdgeModelProfile.fromId(modelConfigActiveModelId),
+            activePath = modelConfigPathActive,
             onEnabledChange = { modelConfigEnabled = it },
-            onPath2BChange = { modelConfigPath2B = it },
-            onPath4BChange = { modelConfigPath4B = it },
+            onActivePathChange = { modelConfigPathActive = it },
             openAiApiKey = modelConfigOpenAiKey,
             onOpenAiApiKeyChange = { modelConfigOpenAiKey = it },
             onDismiss = { showModelConfigDialog = false },
             onSave = {
+                val activeModel = EdgeModelProfile.fromId(modelConfigActiveModelId)
+                val merged = state.localModelPathMap.toMutableMap().apply {
+                    this[activeModel.id] = modelConfigPathActive.trim()
+                }
                 state.persistLocalModelConfig(
                     enabled = modelConfigEnabled,
-                    modelPath2B = modelConfigPath2B.trim(),
-                    modelPath4B = modelConfigPath4B.trim(),
+                    modelPathMap = merged,
                     backendId = LocalModelBackend.LITERT_LM.id,
                     ggufPath2B = state.localGgufPath2B,
                     ggufPath4B = state.localGgufPath4B,
@@ -1847,37 +1950,29 @@ private fun ModelManagementCard(
     onOpenInferenceTest: () -> Unit,
     onOpenModelConfig: () -> Unit,
     selectedDownloadProfile: EdgeModelProfile,
-    modelDownloadUrl: String,
-    modelDownloadToken: String,
     modelDownloadInFlight: Boolean,
     onDownloadTargetSelected: (EdgeModelProfile) -> Unit,
-    onModelDownloadUrlChange: (String) -> Unit,
-    onModelDownloadTokenChange: (String) -> Unit,
     onDownloadModel: () -> Unit,
     onRefreshModelCalls: () -> Unit,
 ) {
     val selectedModel = EdgeModelProfile.fromId(state.edgeModelId)
-    val activePath = if (selectedModel == EdgeModelProfile.GEMMA_EFFECTIVE_2B) {
-        state.localModelPath2B
-    } else {
-        state.localModelPath4B
+    val activePath = state.localModelPathFor(selectedModel)
+    val selectedDownloadInstalled = state.localModelInstalled(selectedDownloadProfile)
+    val installedModels = state.edgeModelOptions.filter { state.localModelInstalled(it) }
+    var downloadTargetExpanded by remember { mutableStateOf(false) }
+    var inUseModelExpanded by remember { mutableStateOf(false) }
+    val progressFraction = when {
+        selectedDownloadInstalled -> 1f
+        modelDownloadInFlight && state.modelDownloadProgress >= 0 -> state.modelDownloadProgress.coerceIn(0, 100) / 100f
+        modelDownloadInFlight -> 0.12f
+        else -> 0f
     }
 
     CommandCenterPanel {
         SectionEyebrow("Models")
         PanelHeader(
             title = "LiteRT-LM Model Management",
-            subtitle = "Switch local models, inspect readiness, and review inference activity.",
-        )
-
-        CompactActionButtonGrid(
-            actions = state.edgeModelOptions.map { option ->
-                CompactActionButtonSpec(
-                    label = option.label,
-                    onClick = { onModelSelected(option.id) },
-                    outlined = option.id != state.edgeModelId,
-                )
-            },
+            subtitle = "Download, switch, and run on-device models with per-model storage + inference logs.",
         )
 
         SignalPillRow(
@@ -1891,9 +1986,15 @@ private fun ModelManagementCard(
 
         InfoSurface {
             Text(
-                text = EdgeModelProfile.fromId(state.edgeModelId).description,
+                text = "${selectedModel.label}: ${selectedModel.description}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = "Current in-use local model: ${selectedModel.label}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = FontWeight.SemiBold,
             )
             Text(
                 text = "Active model file: ${activePath.ifBlank { "<unset>" }}",
@@ -1906,9 +2007,9 @@ private fun ModelManagementCard(
                 color = if (state.latestNativeModelStatus.startsWith("Native model used")) Emerald600 else Amber600,
             )
             Text(
-                text = "Latest output: ${state.latestNativeModelOutput.ifBlank { "<empty>" }}",
+                text = "Model storage: ${state.modelStorageDirPath}",
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurface,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
 
@@ -1925,32 +2026,91 @@ private fun ModelManagementCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
-            CompactActionButtonGrid(
-                actions = state.edgeModelOptions.map { option ->
-                    CompactActionButtonSpec(
-                        label = option.label,
-                        onClick = { onDownloadTargetSelected(option) },
-                        outlined = option != selectedDownloadProfile,
-                    )
-                },
+            Text(
+                text = "Available model to download",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            Box {
+                DropdownSelectorButton(
+                    text = "${selectedDownloadProfile.label} (${selectedDownloadProfile.approxSizeLabel})",
+                    onClick = { downloadTargetExpanded = true },
+                )
+                DropdownMenu(
+                    expanded = downloadTargetExpanded,
+                    onDismissRequest = { downloadTargetExpanded = false },
+                ) {
+                    state.edgeModelOptions.forEach { option ->
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    text = "${option.label} (${option.approxSizeLabel})",
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            },
+                            onClick = {
+                                onDownloadTargetSelected(option)
+                                downloadTargetExpanded = false
+                            },
+                        )
+                    }
+                }
+            }
+            if (selectedDownloadInstalled) {
+                Text(
+                    text = "INSTALLED",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Emerald600,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(999.dp))
+                        .background(Emerald500.copy(alpha = 0.14f))
+                        .border(width = 1.dp, color = Emerald500.copy(alpha = 0.45f), shape = RoundedCornerShape(999.dp))
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                )
+            }
 
-            TextField(
-                value = modelDownloadUrl,
-                onValueChange = onModelDownloadUrlChange,
-                label = {
-                    Text("${ModelDownloadPlan.shortLabelFor(selectedDownloadProfile)} model direct URL")
-                },
-                minLines = 2,
-                modifier = Modifier.fillMaxWidth(),
+            Text(
+                text = "Current in use local model",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            TextField(
-                value = modelDownloadToken,
-                onValueChange = onModelDownloadTokenChange,
-                label = { Text("Hugging Face token (optional)") },
-                minLines = 1,
-                modifier = Modifier.fillMaxWidth(),
-            )
+            if (installedModels.isEmpty()) {
+                Text(
+                    text = "No installed models yet. Download one model first.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Amber600,
+                )
+            } else {
+                Box {
+                    DropdownSelectorButton(
+                        text = "${selectedModel.label} (in use)",
+                        onClick = { inUseModelExpanded = true },
+                    )
+                    DropdownMenu(
+                        expanded = inUseModelExpanded,
+                        onDismissRequest = { inUseModelExpanded = false },
+                    ) {
+                        installedModels.forEach { option ->
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = option.label,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                },
+                                onClick = {
+                                    onModelSelected(option.id)
+                                    inUseModelExpanded = false
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+
             Text(
                 text = "Download status: ${state.modelDownloadStatus}",
                 style = MaterialTheme.typography.bodySmall,
@@ -1961,41 +2121,90 @@ private fun ModelManagementCard(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+
+            Button(
+                onClick = onDownloadModel,
+                enabled = !selectedDownloadInstalled && !modelDownloadInFlight,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color.Transparent,
+                    contentColor = Color.White,
+                ),
+                contentPadding = PaddingValues(0.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(44.dp),
+            ) {
+                Box(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .fillMaxHeight()
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(Slate200),
+                    )
+                    if (progressFraction > 0f) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(progressFraction.coerceIn(0f, 1f))
+                                .fillMaxHeight()
+                                .clip(RoundedCornerShape(999.dp))
+                                .background(Emerald500),
+                        )
+                    }
+                    Text(
+                        text = when {
+                            selectedDownloadInstalled -> "INSTALLED"
+                            modelDownloadInFlight && state.modelDownloadProgress >= 0 ->
+                                "DOWNLOADING ${state.modelDownloadProgress.coerceIn(0, 100)}%"
+                            modelDownloadInFlight -> "DOWNLOADING..."
+                            else -> "DOWNLOAD"
+                        },
+                        fontWeight = FontWeight.Bold,
+                        color = if (progressFraction >= 0.18f) Color.White else Slate700,
+                    )
+                }
+            }
         }
 
         CompactActionButtonGrid(
             actions = listOf(
                 CompactActionButtonSpec(label = "Inference Test", onClick = onOpenInferenceTest, outlined = false),
                 CompactActionButtonSpec(label = "Model Config", onClick = onOpenModelConfig),
-                CompactActionButtonSpec(
-                    label = modelDownloadActionLabel(selectedDownloadProfile, modelDownloadInFlight),
-                    onClick = onDownloadModel,
-                    enabled = !modelDownloadInFlight,
-                ),
                 CompactActionButtonSpec(label = "Refresh Calls", onClick = onRefreshModelCalls),
             ),
         )
     }
 }
 
-internal fun modelDownloadActionLabel(
-    selectedProfile: EdgeModelProfile,
-    downloadInFlight: Boolean,
-): String {
-    if (downloadInFlight) {
-        return "Downloading..."
-    }
-    return "Download ${ModelDownloadPlan.shortLabelFor(selectedProfile)}"
-}
-
-internal fun modelDownloadDraftForProfile(
-    selectedProfile: EdgeModelProfile,
-    url2B: String,
-    url4B: String,
-): String {
-    return when (selectedProfile) {
-        EdgeModelProfile.GEMMA_EFFECTIVE_2B -> url2B
-        EdgeModelProfile.GEMMA_EFFECTIVE_4B -> url4B
+@Composable
+private fun DropdownSelectorButton(
+    text: String,
+    onClick: () -> Unit,
+) {
+    OutlinedButton(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = "▼",
+                color = Slate500,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(start = 8.dp),
+            )
+        }
     }
 }
 
@@ -2380,10 +2589,14 @@ private fun SessionTableHeaderRow() {
         SessionTableCell("Indoor/Outdoor", 120.dp, header = true)
         SessionTableCell("Location", 170.dp, header = true)
         SessionTableCell("Calendar", 180.dp, header = true)
-        SessionTableCell("Guessed User Scenario", 260.dp, header = true)
-        SessionTableCell("Action Plan", 260.dp, header = true)
+        SessionTableCell("Local Scenario", 260.dp, header = true)
+        SessionTableCell("Local Action Plan", 260.dp, header = true)
+        SessionTableCell("Cloud Scenario", 260.dp, header = true)
+        SessionTableCell("Cloud Action Plan", 280.dp, header = true)
+        SessionTableCell("Cloud Status", 150.dp, header = true)
         SessionTableCell("Quick Actions", 250.dp, header = true)
         SessionTableCell("Model", 170.dp, header = true)
+        SessionTableCell("Cloud Model", 140.dp, header = true)
     }
 }
 
@@ -2427,12 +2640,16 @@ private fun SessionTableDataRow(
             SessionTableCell(row.calendarSummary, 180.dp)
             SessionTableCell(row.guessedUserScenario, 260.dp, maxLines = 8)
             SessionTableCell(row.actionPlan, 260.dp, maxLines = 8)
+            SessionTableCell(row.cloudGuessedUserScenario.ifBlank { "-" }, 260.dp, maxLines = 8)
+            SessionTableCell(row.cloudActionPlan.ifBlank { "-" }, 280.dp, maxLines = 8)
+            SessionTableCell(row.cloudStatus.ifBlank { "-" }, 150.dp, maxLines = 3)
             SessionTableQuickActionsCell(
                 actions = row.quickActions,
                 width = 250.dp,
                 onOpen = onOpenQuickAction,
             )
             SessionTableCell(row.modelLabel, 170.dp)
+            SessionTableCell(row.cloudModelLabel.ifBlank { "-" }, 140.dp, maxLines = 3)
         }
         HorizontalDivider(color = Slate200)
     }
@@ -3120,12 +3337,11 @@ private fun InferenceResultDialog(
 @Composable
 private fun LocalModelConfigDialog(
     enabled: Boolean,
-    path2B: String,
-    path4B: String,
+    activeModel: EdgeModelProfile,
+    activePath: String,
     openAiApiKey: String,
     onEnabledChange: (Boolean) -> Unit,
-    onPath2BChange: (String) -> Unit,
-    onPath4BChange: (String) -> Unit,
+    onActivePathChange: (String) -> Unit,
     onOpenAiApiKeyChange: (String) -> Unit,
     onDismiss: () -> Unit,
     onSave: () -> Unit,
@@ -3157,26 +3373,19 @@ private fun LocalModelConfigDialog(
                     color = Slate500,
                 )
                 Text(
-                    text = "LiteRT-LM model paths (.litertlm):",
+                    text = "LiteRT-LM model path (.litertlm):",
                     style = MaterialTheme.typography.bodySmall,
                     color = Slate500,
                 )
                 TextField(
-                    value = path2B,
-                    onValueChange = onPath2BChange,
-                    label = { Text("2B lite model path") },
-                    minLines = 2,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                TextField(
-                    value = path4B,
-                    onValueChange = onPath4BChange,
-                    label = { Text("4B lite model path") },
+                    value = activePath,
+                    onValueChange = onActivePathChange,
+                    label = { Text("${activeModel.label} model path") },
                     minLines = 2,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Text(
-                    text = "Example path: /data/user/0/com.proactiveai.extreme/files/models/gemma-4-E2B-it.litertlm",
+                    text = "Example path: /data/user/0/com.proactiveai.extreme/files/models/${activeModel.defaultLiteRtFileName}",
                     style = MaterialTheme.typography.bodySmall,
                     color = Slate500,
                 )
@@ -3850,6 +4059,17 @@ private fun ContextLogCard(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = Slate700,
                             )
+                            if (log.detail.isNotBlank()) {
+                                Text(
+                                    text = log.detail,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Slate600,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(max = 180.dp)
+                                        .verticalScroll(rememberScrollState()),
+                                )
+                            }
                         }
                     }
                 }
@@ -4382,7 +4602,7 @@ private fun buildFourHourDiaryPrompt(
         .distinctBy { it.lowercase(Locale.US) }
         .take(128)
         .joinToString(separator = "\n") { "- $it" }
-        .ifBlank { "- 无有效语音转录证据" }
+        .ifBlank { "- No valid speech transcript evidence" }
 
     val eventsDigest = events
         .asSequence()
@@ -4391,41 +4611,43 @@ private fun buildFourHourDiaryPrompt(
         .distinctBy { it.lowercase(Locale.US) }
         .take(64)
         .joinToString(separator = "\n") { "- $it" }
-        .ifBlank { "- 暂无足够强的非技术事件证据" }
+        .ifBlank { "- No strong non-technical event evidence yet" }
 
     return """
-        你是运行在手机端的主动AI秘书。
-        请针对一个自然日窗口（00:00-24:00），写“发生了什么”的个人日记，不要写事件计数统计，不要写系统采集过程。
-        输出必须基于证据；如果不确定请明确说“证据不足/不确定”。
-        语气要求：像写给用户自己的日记，具体自然、避免技术腔。
-        长度要求：按证据丰富度动态调整。内容少就短写；内容丰富就写得更完整。
-        如果语音证据中有具体、个人化表达（例如真实想法、具体计划、情绪、人物/地点），请保留1-3句原话（可加引号）以增强真实感。
-        其余重复或泛化内容请合并总结，避免流水账。
-        严禁输出技术字段或系统日志词，例如：
-        events= / category= / source= / status= / payload / lat= / lon= / wifi= / cellular= / context tick / processed / strategy / model / backend。
-        若原始证据含这些词，请改写成人类可读叙述。
+        You are an on-device proactive personal assistant.
+        Write a DAILY diary entry (00:00-24:00) that summarizes what truly happened to this user.
+        Prioritize unique, personal, and human moments over system noise.
+        Do not output event counters or pipeline/process logs.
+        If evidence is weak, explicitly say uncertainty.
+        Tone: natural, personal, reflective, and specific.
+        Output language MUST be English only.
+        Keep 1-3 vivid quotes from speech evidence when they reveal real thoughts, plans, emotions, names, or places.
+        Merge repetitive signals into concise narrative blocks.
+        Never output technical key-value logs such as:
+        events= / category= / source= / status= / payload / lat= / lon= / wifi= / cellular= / context tick / processed / strategy / model / backend.
+        If such terms appear in evidence, rewrite into human-readable language.
 
-        窗口: $windowLabel
-        语音线索: ${snapshot.speechSummary}
-        语音转录证据(高优先级):
+        Window: $windowLabel
+        Speech signal: ${snapshot.speechSummary}
+        High-priority speech evidence:
         $speechDigest
-        位置线索: ${snapshot.positionSummary}
-        室内外: ${snapshot.indoorOutdoor}
-        地点: ${snapshot.locationLabel}
-        日程线索: ${snapshot.calendarSummary}
-        关键事件:
+        Position signal: ${snapshot.positionSummary}
+        Indoor/Outdoor: ${snapshot.indoorOutdoor}
+        Location: ${snapshot.locationLabel}
+        Calendar signal: ${snapshot.calendarSummary}
+        Key events:
         $eventsDigest
 
-        严格按以下格式输出（纯文本）:
-        Diary Summary: <6-16句，像日记，描述这一天具体发生了什么；有个人细节就保留>
+        Output in this exact plain-text format:
+        Diary Summary: <6-16 sentences, personal diary style, specific and evidence-grounded>
         Proactive AI Can Help:
-        - <我可以立刻帮你的事情1>
-        - <我可以立刻帮你的事情2>
-        - <可选第三项>
+        - <immediate help 1>
+        - <immediate help 2>
+        - <optional immediate help 3>
         Self TODO:
-        - <你该给自己的待办1>
-        - <你该给自己的待办2>
-        - <可选第三项>
+        - <personal todo 1>
+        - <personal todo 2>
+        - <optional personal todo 3>
     """.trimIndent()
 }
 
@@ -4504,7 +4726,8 @@ private fun parseFourHourDiaryOutput(
         .take(8)
         .joinToString(separator = " ")
         .ifBlank { fallback.summary }
-    val summary = summaryCandidate.take(diarySummaryCharLimit(summaryCandidate))
+    val summary = if (containsCjk(summaryCandidate)) fallback.summary else summaryCandidate
+    val finalSummary = summary.take(diarySummaryCharLimit(summary))
 
     val proactiveHelpCandidate = helpLines
         .asSequence()
@@ -4515,7 +4738,8 @@ private fun parseFourHourDiaryOutput(
         .take(3)
         .joinToString(separator = " | ")
         .ifBlank { fallback.proactiveHelp }
-    val proactiveHelp = proactiveHelpCandidate.take(diaryActionCharLimit(proactiveHelpCandidate))
+    val proactiveHelp = if (containsCjk(proactiveHelpCandidate)) fallback.proactiveHelp else proactiveHelpCandidate
+    val finalProactiveHelp = proactiveHelp.take(diaryActionCharLimit(proactiveHelp))
 
     val selfTodoCandidate = todoLines
         .asSequence()
@@ -4526,13 +4750,21 @@ private fun parseFourHourDiaryOutput(
         .take(3)
         .joinToString(separator = " | ")
         .ifBlank { fallback.selfTodo }
-    val selfTodo = selfTodoCandidate.take(diaryActionCharLimit(selfTodoCandidate))
+    val selfTodo = if (containsCjk(selfTodoCandidate)) fallback.selfTodo else selfTodoCandidate
+    val finalSelfTodo = selfTodo.take(diaryActionCharLimit(selfTodo))
 
     return FourHourDiaryParsed(
-        summary = summary,
-        proactiveHelp = proactiveHelp,
-        selfTodo = selfTodo,
+        summary = finalSummary,
+        proactiveHelp = finalProactiveHelp,
+        selfTodo = finalSelfTodo,
     )
+}
+
+private fun containsCjk(text: String): Boolean {
+    if (text.isBlank()) return false
+    return text.any { ch ->
+        Character.UnicodeScript.of(ch.code) == Character.UnicodeScript.HAN
+    }
 }
 
 private fun selectDiarySignalEvents(events: List<ContextEventPayload>): List<ContextEventPayload> {
@@ -4669,23 +4901,23 @@ private fun buildFourHourSummary(
 
     val opening = when {
         !calendarDigest.isNullOrBlank() ->
-            "这一天你主要在$locationDigest，围绕“$calendarDigest”推进事情，整体节奏比较明确。"
+            "You spent most of the day around $locationDigest, with a clear thread around \"$calendarDigest\"."
         speechEvidence.isNotEmpty() ->
-            "这一天你主要在$locationDigest，很多注意力放在你口头提到的事项上，状态比较投入。"
+            "You were mostly around $locationDigest, and your spoken notes show sustained focus on concrete personal priorities."
         else ->
-            "这一天你主要在$locationDigest，整体在持续推进手头事项。"
+            "You were mostly around $locationDigest, steadily moving through your day with light but consistent progress."
     }
 
     val moments = if (keyMoments.isEmpty()) {
         ""
     } else {
-        "比较具体的片段有：${keyMoments.joinToString("；")}。"
+        "Notable moments: ${keyMoments.joinToString("; ")}."
     }
 
     val quotes = if (quoteMoments.isEmpty()) {
         ""
     } else {
-        "你当时的原话里，有这些很具体的表达：${quoteMoments.joinToString("；")}。"
+        "Your own words captured some vivid detail: ${quoteMoments.joinToString("; ")}."
     }
 
     val narrative = listOf(opening, moments, quotes)
@@ -4709,9 +4941,9 @@ private fun humanizeLocationForDiary(
     }
     val indoorOutdoorClean = sanitizeDiaryNarrativeLine(indoorOutdoor)
     return when {
-        indoorOutdoorClean.contains("Indoor", ignoreCase = true) -> "室内环境"
-        indoorOutdoorClean.contains("Outdoor", ignoreCase = true) -> "户外环境"
-        else -> "你所在的环境"
+        indoorOutdoorClean.contains("Indoor", ignoreCase = true) -> "an indoor setting"
+        indoorOutdoorClean.contains("Outdoor", ignoreCase = true) -> "an outdoor setting"
+        else -> "your surrounding environment"
     }
 }
 
@@ -4772,19 +5004,19 @@ private fun buildFourHourProactiveHelp(
 
     val actions = mutableListOf<String>()
     if (calendarSignals > 0) {
-        actions += "先为下一场会议整理3点简报和关联资料，随时可发送。"
+        actions += "Prepare a concise pre-meeting brief (3 bullets + relevant links) ready to send."
     }
     if (commSignals > 0) {
-        actions += "把未读消息按优先级排序，并给出可直接发送的回复草稿。"
+        actions += "Prioritize unread communication and draft send-ready replies for the top items."
     }
     if (containsAny(summaryLower, listOf("奶茶", "milk tea", "bubble tea", "boba"))) {
-        actions += "直接给出附近奶茶选项和可点击下单/导航入口。"
+        actions += "Provide nearby milk tea options with clickable order/navigation links."
     }
     if (containsAny(speechLower, listOf("buy", "order", "need", "想", "要", "买"))) {
-        actions += "把你口头意图转换成一步可执行动作，减少确认成本。"
+        actions += "Convert the strongest spoken intent into one immediate, executable step."
     }
     if (actions.isEmpty()) {
-        actions += "继续低打扰监控，只在高置信度时给出可执行建议。"
+        actions += "Keep low-noise monitoring and surface only high-confidence, concrete assists."
     }
     val result = actions.distinct().take(3).joinToString(" | ")
     return result.take(diaryActionCharLimit(result))
@@ -4798,19 +5030,19 @@ private fun buildFourHourSelfTodo(
     val todos = mutableListOf<String>()
 
     if (containsAny(summaryLower, listOf("meeting", "calendar", "deadline", "会议", "日程"))) {
-        todos += "确认下一场会议目标与必须材料，避免临时准备。"
+        todos += "Lock the objective and required materials for your next meeting."
     }
     if (containsAny(summaryLower, listOf("email", "message", "inbox", "slack", "github", "邮件", "消息"))) {
-        todos += "先清掉最高优先级未读沟通，再进入下一任务。"
+        todos += "Clear the highest-priority pending communication before context-switching."
     }
     if (!snapshot.speechSummary.startsWith("No speech", ignoreCase = true)) {
-        todos += "把最近口头想法落成一个可执行下一步。"
+        todos += "Turn your strongest spoken idea into one concrete next action."
     }
     if (snapshot.indoorOutdoor.contains("Outdoor", ignoreCase = true) || snapshot.positionSummary.contains("motion=", ignoreCase = true)) {
-        todos += "移动中先做短任务，深度任务留到稳定场景。"
+        todos += "Do short, low-friction tasks while moving; reserve deep work for stable time blocks."
     }
     if (todos.isEmpty()) {
-        todos += "写下今天剩余时间最重要的一件事并设置提醒。"
+        todos += "Write down the single most important remaining task today and set a reminder."
     }
     val result = todos.distinct().take(3).joinToString(" | ")
     return result.take(diaryActionCharLimit(result))
@@ -4869,7 +5101,24 @@ private fun buildFifteenMinuteSessions(
     maxSessions: Int,
 ): List<FifteenMinuteSession> {
     if (events.isEmpty()) return emptyList()
-    val contextOnly = events.filterNot { it.source == "local_model" || it.category == "model_io" }
+    val now = System.currentTimeMillis()
+    val minTs = now - ASSISTANT_SESSION_LOOKBACK_MS
+    val maxTs = now + ASSISTANT_SESSION_FUTURE_TOLERANCE_MS
+    val excludedCategories = setOf(
+        "model_io",
+        "assistant_session",
+        "context_log",
+        "audio_gate",
+        "capability_status",
+        "daily_focus",
+    )
+    val contextOnly = events.filterNot { event ->
+        val categoryLower = event.category.lowercase(Locale.US)
+        event.occurredAt !in minTs..maxTs ||
+            event.source == "local_model" ||
+            categoryLower in excludedCategories ||
+            categoryLower.endsWith("_bootstrap")
+    }
     if (contextOnly.isEmpty()) return emptyList()
 
     return contextOnly
@@ -4906,6 +5155,7 @@ private fun buildSessionContextSnapshot(
     val speechSignals = mutableListOf<SpeechSignal>()
     var latitude: Double? = null
     var longitude: Double? = null
+    var cityLabel: String? = null
     var motionState: String? = null
     var latestLocationSummary: String? = null
     val wifiSignals = mutableListOf<Boolean>()
@@ -4939,6 +5189,9 @@ private fun buildSessionContextSnapshot(
             if (motionState == null) {
                 motionState = payloadString(event.payload, "motionState")
             }
+            if (cityLabel == null) {
+                cityLabel = payloadString(event.payload, "city")
+            }
             if (latestLocationSummary == null) {
                 latestLocationSummary = event.summary
             }
@@ -4961,6 +5214,20 @@ private fun buildSessionContextSnapshot(
         }
     }
 
+    val fallbackLocation = if (latitude == null || longitude == null) {
+        loadRecentLocationFallback(
+            context = context,
+            beforeMs = ordered.firstOrNull()?.occurredAt ?: System.currentTimeMillis(),
+        )
+    } else {
+        null
+    }
+    if (latitude == null) latitude = fallbackLocation?.latitude
+    if (longitude == null) longitude = fallbackLocation?.longitude
+    if (cityLabel.isNullOrBlank()) cityLabel = fallbackLocation?.city
+    if (motionState.isNullOrBlank()) motionState = fallbackLocation?.motionState
+    if (latestLocationSummary.isNullOrBlank()) latestLocationSummary = fallbackLocation?.summary
+
     val speechSummary = buildSpeechSummaryFromSignals(
         signals = speechSignals,
         maxSegments = maxSpeechSegments,
@@ -4978,7 +5245,13 @@ private fun buildSessionContextSnapshot(
     }
 
     val indoorOutdoor = inferIndoorOutdoor(wifiSignals, cellularSignals)
-    val locationLabel = reverseGeocodeLabel(context, lat, lon)
+    val geocoded = reverseGeocodeLabel(context, lat, lon)
+    val locationLabel = when {
+        !cityLabel.isNullOrBlank() && geocoded.startsWith("GPS ", ignoreCase = true) -> "$cityLabel | $geocoded"
+        !cityLabel.isNullOrBlank() && geocoded.startsWith("Unknown", ignoreCase = true) -> cityLabel.orEmpty()
+        !cityLabel.isNullOrBlank() -> "$cityLabel | ${geocoded.take(80)}"
+        else -> geocoded
+    }
     val calendarSummary = calendarSignals
         .asSequence()
         .map { normalizeSnippet(it) }
@@ -4998,6 +5271,47 @@ private fun buildSessionContextSnapshot(
         sparklingSignalCount = sparklingSignalCount,
         sparklingTriggers = sparklingTriggers.joinToString(separator = ", ").ifBlank { "-" },
     )
+}
+
+private data class LocationFallbackSignal(
+    val latitude: Double?,
+    val longitude: Double?,
+    val city: String?,
+    val motionState: String?,
+    val summary: String?,
+)
+
+private fun loadRecentLocationFallback(
+    context: android.content.Context,
+    beforeMs: Long,
+): LocationFallbackSignal? {
+    val minTs = beforeMs - LOCATION_SESSION_FALLBACK_LOOKBACK_MS
+    val rows = ContextEventStore.getInstance(context)
+        .getRecent(limit = 480)
+        .asSequence()
+        .filter { row ->
+            row.occurredAt in minTs..beforeMs &&
+                (row.category.equals("location", ignoreCase = true) ||
+                    row.source.contains("location", ignoreCase = true))
+        }
+    for (row in rows) {
+        val payloadRaw = kotlin.runCatching { JSONObject(row.payloadJson).toMap() }.getOrDefault(emptyMap())
+        val payload = normalizeAnyMap(payloadRaw)
+        val latitude = payloadDouble(payload, "latitude")
+        val longitude = payloadDouble(payload, "longitude")
+        val city = payloadString(payload, "city")
+        val motionState = payloadString(payload, "motionState")
+        if (latitude != null && longitude != null) {
+            return LocationFallbackSignal(
+                latitude = latitude,
+                longitude = longitude,
+                city = city,
+                motionState = motionState,
+                summary = row.summary,
+            )
+        }
+    }
+    return null
 }
 
 private data class SpeechSignal(
@@ -5154,16 +5468,17 @@ private fun buildAssistantPromptForSession(
 ): String {
     return """
         You are a proactive personal assistant running fully on-device.
-        Analyze one 15-minute session and infer the user's likely scenario.
-        The answer must be evidence-grounded, not generic.
-        You must use at least two evidence signals from speech / calendar / motion / connectivity.
-        If mood evidence is weak, state mood as uncertain.
-        Make action steps aggressive and immediately executable in the next 10 minutes.
-        Prefer direct outcomes (book/order/open/contact) over passive suggestions.
-        Only propose domains that are directly supported by session evidence.
-        Do NOT invent unrelated tools/apps/tasks (for example GitHub, calendar prep, Gmail, Slack) unless explicitly supported by speech/calendar/event evidence in this session.
-        If evidence is weak, output fewer steps (1-2) and keep them targeted to the strongest explicit user intent.
-        For each action step, include one concrete endpoint or query target and mention the evidence phrase briefly.
+        Analyze one 15-minute context session and infer the user's real need.
+        Avoid generic productivity templates. Be specific, evidence-grounded, and immediately useful.
+        Prioritize these action classes:
+        1) Deep research candidate: if user mentions investment/finance/company/person/project worth researching.
+        2) Daily-life problem solving: restaurants, milk tea, haircut, shopping, logistics, errands.
+        3) Emotional support: if user sounds angry/sad/anxious/proud, respond with appropriate tone and coping/grounding step.
+        4) Health nudges: hydration, stand/walk, food/rest timing; can leverage recent behavior pattern.
+        5) Explicit command execution: when user clearly asks to investigate/schedule/set up something.
+        For life-problem actions, include direct links or direction/search entry points (maps/search/booking) instead of abstract advice.
+        Every action must be executable in 5-30 minutes.
+        If evidence is weak, output at most 2 precise actions.
 
         Session window: ${formatSessionRange(session.startMs, session.endMs)}
         Event count: ${session.events.size}
@@ -5175,12 +5490,29 @@ private fun buildAssistantPromptForSession(
         Calendar signal: ${snapshot.calendarSummary}
 
         Respond in exactly this plain-text format:
-        Guessed User Scenario: <one sentence including likely activity, workload state, and mood>
+        Guessed User Scenario: <one sentence including likely current activity and mood>
         Action Plan:
-        - <step 1>
-        - <step 2>
-        - <step 3>
+        - <step 1 with concrete target + optional direct link/search query + evidence in parentheses>
+        - <step 2 with concrete target + optional direct link/search query + evidence in parentheses>
+        - <step 3 with concrete target + optional direct link/search query + evidence in parentheses>
     """.trimIndent()
+}
+
+private fun buildCloudSessionEventDigest(events: List<ContextEventPayload>): String {
+    if (events.isEmpty()) return "- No events."
+    return events
+        .asSequence()
+        .sortedByDescending { it.occurredAt }
+        .take(24)
+        .map { event ->
+            val summary = normalizeSnippet(event.summary)
+            val source = event.source.take(28)
+            val category = event.category.take(28)
+            "- [$category/$source] $summary"
+        }
+        .toList()
+        .joinToString(separator = "\n")
+        .ifBlank { "- No events." }
 }
 
 private fun parseSessionInferenceOutput(
@@ -5247,7 +5579,7 @@ private fun parseSessionInferenceOutput(
         else -> lines.drop(1).take(2).joinToString(separator = " | ").ifBlank {
             "Continue passive monitoring and wait for stronger context."
         }
-    }.take(420)
+    }.take(720)
 
     val finalScenario = if (isWeakScenario(scenario)) fallbackScenario else scenario
     val finalActionPlan = if (isWeakActionPlan(modelActionPlan)) fallbackActionPlan else modelActionPlan
@@ -5261,20 +5593,18 @@ private fun parseSessionInferenceOutput(
 private fun buildHeuristicScenarioGuess(
     session: FifteenMinuteSession,
     snapshot: SessionContextSnapshot,
+    allEvents: List<ContextEventPayload> = session.events,
 ): SessionHeuristicGuess {
     val hasSpeech = !snapshot.speechSummary.startsWith("No speech", ignoreCase = true)
     val speechLower = snapshot.speechSummary.lowercase(Locale.US)
+    val calendarLower = snapshot.calendarSummary.lowercase(Locale.US)
     val calendarSignals = session.events.count { event ->
-        val lower = event.summary.lowercase(Locale.US)
-        event.category.equals("calendar", ignoreCase = true) ||
-            event.category.equals("task", ignoreCase = true) ||
-            containsAny(lower, listOf("meeting", "calendar", "deadline", "agenda", "appointment"))
+        val categoryLower = event.category.lowercase(Locale.US)
+        categoryLower == "calendar" || categoryLower == "task"
     }
     val commSignals = session.events.count { event ->
-        val lower = event.summary.lowercase(Locale.US)
-        event.category.equals("communication", ignoreCase = true) ||
-            event.category.equals("notification", ignoreCase = true) ||
-            containsAny(lower, listOf("email", "message", "inbox", "slack", "github", "reply", "notification"))
+        val categoryLower = event.category.lowercase(Locale.US)
+        categoryLower == "communication" || categoryLower == "notification"
     }
     val motionState = when {
         snapshot.positionSummary.contains("motion=driving", ignoreCase = true) -> "driving"
@@ -5283,35 +5613,123 @@ private fun buildHeuristicScenarioGuess(
         else -> "unknown"
     }
 
-    val activity = when {
-        session.isSparkling && hasSpeech ->
-            "User intentionally marked a sparkling moment while speaking and expects immediate help"
-        session.isSparkling ->
-            "User intentionally marked this as a high-value moment and expects focused proactive support"
-        motionState == "driving" || motionState == "walking" ->
-            "User is likely commuting or moving between locations"
-        calendarSignals > 0 && hasSpeech ->
-            "User is likely preparing for or discussing meetings/tasks"
-        calendarSignals > 0 ->
-            "User is likely in planning mode around upcoming meetings/tasks"
-        commSignals >= 2 ->
-            "User is likely handling communication and coordination work"
-        hasSpeech ->
-            "User is likely in a conversation or active thinking flow"
-        else ->
-            "User activity is low-signal; likely between tasks or quietly working"
-    }
+    val explicitWorkMarkers = listOf(
+        "meeting", "deadline", "client", "customer", "project", "repo", "github",
+        "slack", "email", "inbox", "follow-up", "doc", "ppt", "汇报", "客户", "项目", "会议", "周报", "邮件"
+    )
+    val hasExplicitWorkIntent = containsAny(speechLower, explicitWorkMarkers) ||
+        (!calendarLower.startsWith("no meeting") && containsAny(calendarLower, explicitWorkMarkers))
 
-    val workloadScore = calendarSignals * 2 + commSignals + if (hasSpeech) 1 else 0
-    val workload = when {
-        workloadScore >= 6 -> "high"
-        workloadScore >= 3 -> "medium"
-        else -> "low"
+    val foodIntent = containsAny(
+        speechLower,
+        listOf("奶茶", "milk tea", "bubble tea", "boba", "coffee", "咖啡", "吃饭", "lunch", "dinner", "外卖", "order food", "餐厅"),
+    )
+    val shoppingIntent = containsAny(
+        speechLower,
+        listOf("buy", "purchase", "shop", "shopping", "grocery", "groceries", "超市", "药店", "买", "采购", "下单"),
+    )
+    val commuteIntent = motionState == "driving" || motionState == "walking" ||
+        containsAny(speechLower, listOf("commute", "drive", "parking", "route", "导航", "打车", "地铁", "bus", "train", "trip", "出发"))
+    val socialIntent = containsAny(
+        speechLower,
+        listOf("call", "text", "message", "reply", "follow up", "朋友", "家人", "同事", "联系", "回消息"),
+    )
+    val healthIntent = containsAny(
+        speechLower,
+        listOf("tired", "sleep", "rest", "walk", "exercise", "workout", "累", "休息", "睡", "锻炼", "健康"),
+    )
+    val deepResearchIntent = containsAny(
+        speechLower,
+        listOf(
+            "stock", "stocks", "equity", "earnings", "valuation", "investment", "portfolio", "fund",
+            "crypto", "token", "bond", "ipo", "company", "founder", "ceo", "market", "trading", "macro",
+            "project", "person", "research", "investigate", "due diligence", "尽调", "调研", "投资", "股票", "基金", "项目", "人物",
+        ),
+    )
+    val haircutIntent = containsAny(
+        speechLower,
+        listOf("haircut", "barber", "salon", "理发", "发型", "剪头发"),
+    )
+    val restaurantIntent = containsAny(
+        speechLower,
+        listOf("restaurant", "dining", "eat", "lunch", "dinner", "brunch", "餐厅", "吃饭"),
+    )
+    val explicitCommandIntent = containsAny(
+        speechLower,
+        listOf("investigate", "look into", "find out", "schedule", "set meeting", "book", "reserve", "remind me", "帮我查", "帮我调查", "安排", "预订"),
+    )
+    val angerIntent = containsAny(
+        speechLower,
+        listOf("angry", "annoyed", "frustrated", "furious", "烦", "生气", "躁", "火大"),
+    )
+    val sadIntent = containsAny(
+        speechLower,
+        listOf("sad", "down", "lonely", "depressed", "upset", "难过", "低落", "伤心", "沮丧"),
+    )
+    val proudIntent = containsAny(
+        speechLower,
+        listOf("proud", "excited", "confident", "great", "awesome", "得意", "兴奋", "自信"),
+    )
+    val sessionHour = Calendar.getInstance().apply { timeInMillis = session.endMs }.get(Calendar.HOUR_OF_DAY)
+    val mealWindow = sessionHour in 11..14 || sessionHour in 18..21
+    val motionSignals2h = allEvents
+        .asSequence()
+        .filter { it.occurredAt in (session.endMs - 2 * 60 * 60 * 1000L)..session.endMs }
+        .filter { it.category.equals("location", ignoreCase = true) || it.source.contains("location", ignoreCase = true) }
+        .mapNotNull { payloadString(it.payload, "motionState")?.lowercase(Locale.US) }
+        .toList()
+    val mostlyStill2h = motionSignals2h.isNotEmpty() &&
+        motionSignals2h.count { it == "still" || it == "unknown" } >= (motionSignals2h.size * 0.7)
+    val healthNudgeIntent = healthIntent || mostlyStill2h || (mealWindow && hasSpeech)
+    val locationHint = snapshot.locationLabel
+        .takeIf { it.isNotBlank() && !it.startsWith("Unknown", ignoreCase = true) }
+        ?.take(48)
+        ?: "near me"
+    val milkTeaLink = "https://www.google.com/maps/search/?api=1&query=${encodeQuery("$locationHint milk tea")}"
+    val restaurantLink = "https://www.google.com/maps/search/?api=1&query=${encodeQuery("$locationHint restaurant reservation")}"
+    val haircutLink = "https://www.google.com/maps/search/?api=1&query=${encodeQuery("$locationHint barber salon")}"
+    val deepResearchLink = "https://www.google.com/search?udm=50&q=${encodeQuery("${snapshot.speechSummary.take(80)} deep research latest analysis")}"
+
+    val activity = when {
+        deepResearchIntent ->
+            "User surfaced a topic that likely needs deep research before acting"
+        session.isSparkling && hasSpeech ->
+            "User intentionally marked a sparkling moment and likely wants fast help on a specific personal need"
+        session.isSparkling ->
+            "User intentionally marked this as high-value and expects focused assistance now"
+        angerIntent || sadIntent || proudIntent ->
+            "User appears emotionally loaded and needs context-aware support, not generic productivity"
+        foodIntent ->
+            "User likely wants immediate food/drink options and a quick decision"
+        commuteIntent ->
+            "User is likely moving between places and needs low-friction guidance"
+        shoppingIntent || haircutIntent || restaurantIntent ->
+            "User likely has a purchase/errand intent and needs fast options"
+        socialIntent ->
+            "User likely needs to contact someone or follow up on a conversation"
+        explicitCommandIntent ->
+            "User issued an explicit command and expects direct execution support"
+        hasExplicitWorkIntent ->
+            "User likely has a work-related follow-up that needs a concrete next step"
+        hasSpeech ->
+            "User is in an active thinking/conversation flow with practical immediate intent"
+        else ->
+            "Signal is light; user is likely between tasks"
     }
 
     val mood = when {
+        angerIntent ->
+            "agitated"
+        sadIntent ->
+            "sad/low-energy"
+        proudIntent ->
+            "confident/excited"
         containsAny(speechLower, listOf("urgent", "rush", "deadline", "late", "stressed", "烦", "急")) ->
             "slightly stressed"
+        containsAny(speechLower, listOf("hungry", "饿", "想喝", "want to drink")) ->
+            "intent-driven"
+        containsAny(speechLower, listOf("tired", "累", "困", "sleepy")) ->
+            "fatigued"
         containsAny(speechLower, listOf("great", "good", "nice", "happy", "awesome", "开心", "不错")) ->
             "positive"
         hasSpeech ->
@@ -5322,42 +5740,85 @@ private fun buildHeuristicScenarioGuess(
 
     val evidence = buildList {
         if (session.isSparkling) add("sparkling_marker=${session.sparklingTriggers.joinToString(",").ifBlank { "manual" }}")
-        if (calendarSignals > 0) add("calendar/task signals=$calendarSignals")
+        if (deepResearchIntent) add("deep-research markers in speech")
+        if (foodIntent) add("food/drink phrase in speech")
+        if (haircutIntent) add("grooming service phrase in speech")
+        if (shoppingIntent) add("purchase/errand phrase in speech")
+        if (restaurantIntent) add("restaurant booking phrase in speech")
+        if (explicitCommandIntent) add("explicit command phrase in speech")
+        if (angerIntent || sadIntent || proudIntent) add("emotional expression in speech")
+        if (socialIntent) add("contact/follow-up phrase in speech")
+        if (healthNudgeIntent) add("health/rest or sedentary pattern signal")
+        if (calendarSignals > 0 && hasExplicitWorkIntent) add("calendar/task signals=$calendarSignals")
         if (commSignals > 0) add("communication signals=$commSignals")
+        if (mostlyStill2h) add("mostly still in last ~2h")
         if (motionState != "unknown") add("motion=$motionState")
         if (!snapshot.indoorOutdoor.equals("Unknown", ignoreCase = true)) add(snapshot.indoorOutdoor)
         if (hasSpeech) add("speech=\"${snapshot.speechSummary.take(70)}\"")
     }.ifEmpty { listOf("limited context signals") }
 
-    val sparklingBoost = if (session.isSparkling) 16 else 0
-    val confidence = (45 + evidence.size * 10 + minOf(3, workloadScore) * 5 + sparklingBoost).coerceIn(35, 96)
+    val intentScore = listOf(
+        foodIntent,
+        shoppingIntent,
+        commuteIntent,
+        socialIntent,
+        healthNudgeIntent,
+        deepResearchIntent,
+        explicitCommandIntent,
+    )
+        .count { it }
+    val sparklingBoost = if (session.isSparkling) 14 else 0
+    val confidence = (44 + evidence.size * 9 + intentScore * 5 + sparklingBoost).coerceIn(35, 96)
     val scenario = buildString {
-        append("$activity; workload=$workload; mood=$mood; confidence=$confidence%. ")
+        append("$activity; mood=$mood; confidence=$confidence%. ")
         append("Evidence: ${evidence.joinToString(", ")}.")
     }.take(220)
 
     val actions = mutableListOf<String>()
     if (session.isSparkling) {
-        actions += "Capture this sparkling moment as a priority note with one concrete next action and deadline."
+        actions += "Pin this sparkling moment and convert it into one concrete next step the user can execute now."
     }
-    val milkTeaIntent = containsAny(speechLower, listOf("奶茶", "milk tea", "bubble tea", "boba", "茶饮"))
-    if (milkTeaIntent) {
-        actions += "Find top nearby milk tea shops by ETA and rating, then show direct order/search links."
-        actions += "Prepare a default order draft (size, sugar, ice) and ask one-tap confirmation."
+    if (deepResearchIntent) {
+        actions += "Run deep research now: build a one-page brief (thesis, upside, downside, key people, next 7-day catalysts). Link: $deepResearchLink (evidence: research/investment phrase)."
     }
-    if (calendarSignals > 0) {
-        actions += "Prepare a 3-point brief for the next meeting/task."
-        actions += "Surface the most relevant notes/files before the meeting."
+    if (foodIntent) {
+        actions += "Find 3 nearby milk tea options with ratings + distance + open direction link: $milkTeaLink (evidence: speech intent)."
+        actions += "Open an AI search for best current deals/coupons near $locationHint: https://www.google.com/search?udm=50&q=${encodeQuery("$locationHint milk tea deals coupon")} (evidence: drink intent)."
     }
-    if (commSignals > 0) {
-        actions += "Prioritize top pending messages and draft concise replies."
+    if (restaurantIntent) {
+        actions += "Show reservable restaurants near current area with direct map/search entry: $restaurantLink (evidence: dining intent)."
     }
-    if (motionState == "driving" || motionState == "walking") {
-        actions += "Keep interventions short and defer deep tasks until stationary."
+    if (haircutIntent) {
+        actions += "Find top-rated barber/salon options and open direction: $haircutLink (evidence: haircut phrase)."
     }
-    if (actions.isEmpty()) {
-        actions += "Run one targeted search from current context and surface three executable links."
-        actions += "Ask one confirmation question, then execute the highest-confidence next step."
+    if (shoppingIntent) {
+        actions += "Create a buy-now checklist and open nearest store search: https://www.google.com/maps/search/?api=1&query=${encodeQuery("$locationHint grocery store")} (evidence: purchase phrase)."
+    }
+    if (commuteIntent) {
+        actions += "Open quickest route/travel option from current location and suggest optimal departure timing (evidence: motion/location)."
+    }
+    if (angerIntent) {
+        actions += "Emotional guardrail: pause 90 seconds before reacting, then draft a calm response in 3 lines (evidence: anger markers)."
+    }
+    if (sadIntent) {
+        actions += "Support mode: start a short check-in conversation now and suggest one low-effort comforting step (walk/water/call a trusted person)."
+    }
+    if (proudIntent) {
+        actions += "Momentum with caution: capture this win in 2 lines, then add one risk-control check before next decision."
+    }
+    if (socialIntent) {
+        actions += "Draft a concise follow-up message for the mentioned person with one clear ask (evidence: contact phrase)."
+    }
+    if (healthNudgeIntent) {
+        actions += "Health nudge: stand up, drink water, and do a 3-5 minute walk now; then set a 30-minute movement reminder (evidence: sedentary/health signal)."
+    }
+    if (explicitCommandIntent || hasExplicitWorkIntent) {
+        actions += "Convert the explicit command into an execution checklist with owner/time/output and start with step 1 immediately."
+    }
+    if (actions.isEmpty() && hasSpeech) {
+        actions += "Use the strongest spoken phrase to produce 3 concrete next options with direct links near current context."
+    } else if (actions.isEmpty()) {
+        actions += "Ask one concise clarification question, then open an AI search entry to unblock next step: https://www.google.com/search?udm=50&q=${encodeQuery("best next step based on current context near me")}."
     }
 
     return SessionHeuristicGuess(
@@ -5385,10 +5846,30 @@ private fun isWeakScenario(text: String): Boolean {
 private fun isWeakActionPlan(text: String): Boolean {
     val lower = text.lowercase(Locale.US)
     if (text.length < 24) return true
-    return containsAny(
+    val hasDirectEntry = lower.contains("http://") ||
+        lower.contains("https://") ||
+        lower.contains("maps/search") ||
+        lower.contains("google.com/search")
+    val generic = containsAny(
         lower,
-        listOf("continue passive monitoring", "wait for stronger context", "no action")
+        listOf(
+            "continue passive monitoring",
+            "wait for stronger context",
+            "no action",
+            "open calendar",
+            "check calendar",
+            "open github",
+            "prepare a 3-point brief",
+            "surface the most relevant notes",
+            "prioritize top pending messages",
+            "review notes",
+            "maintain monitoring",
+            "keep collecting context",
+        )
     )
+    if (generic && !hasDirectEntry) return true
+    val weakVerbCount = listOf("open", "check", "review", "monitor").count { lower.contains(it) }
+    return weakVerbCount >= 2 && !hasDirectEntry
 }
 
 private fun containsAny(text: String, needles: List<String>): Boolean {
